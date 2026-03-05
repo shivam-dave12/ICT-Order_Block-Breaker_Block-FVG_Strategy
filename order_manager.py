@@ -166,9 +166,13 @@ class OrderManager:
          SL and TP simultaneously before a state transition.
     """
 
-    _RETRY_STATUS_CODES = {429, 500, 502, 503}   # 401 removed — auth errors are permanent
-    _MAX_RETRIES        = 3
-    _RETRY_BASE_SLEEP   = 3.0   # seconds; matches GlobalRateLimiter interval
+    _RETRY_STATUS_CODES       = {429, 500, 502, 503}
+    _MAX_RETRIES              = 3
+    _RETRY_BASE_SLEEP         = 3.0    # seconds; matches GlobalRateLimiter interval
+    # 401 from CoinSwitch can be spurious under rapid sequential requests.
+    # We retry up to this many times with increasing delays before giving up.
+    _MAX_401_RETRIES          = 3
+    _401_RETRY_DELAY_SEC      = 12.0   # base delay; multiplied by attempt number
 
     def __init__(self):
         self.api = FuturesAPI(
@@ -219,23 +223,35 @@ class OrderManager:
         Call api.place_order with exponential-backoff retry on transient errors.
         Returns the 'data' dict on success, None on permanent failure.
         Never raises.
+
+        401 handling:
+            CoinSwitch occasionally returns 401 "API Key or Signature is not Correct"
+            for valid credentials under rapid sequential requests (likely a server-side
+            rate-limit or session quirk expressed as 401 instead of 429).
+            We treat 401 as potentially transient and retry up to _MAX_401_RETRIES
+            times with _401_RETRY_DELAY_SEC * attempt_number delays before giving up.
         """
-        for attempt in range(self._MAX_RETRIES):
+        consecutive_401s = 0
+        total_attempts   = self._MAX_RETRIES + self._MAX_401_RETRIES  # upper bound
+        attempt          = 0
+
+        while attempt < total_attempts:
             GlobalRateLimiter.wait()
             try:
                 resp = self.api.place_order(**kwargs)
             except Exception as e:
                 logger.error(f"place_order exception (attempt {attempt + 1}): {e}")
-                if attempt < self._MAX_RETRIES - 1:
-                    time.sleep(self._RETRY_BASE_SLEEP * (2 ** attempt))
+                attempt += 1
+                if attempt < self._MAX_RETRIES:
+                    time.sleep(self._RETRY_BASE_SLEEP * (2 ** min(attempt, 3)))
                 continue
 
-            # Success path
+            # ── Success path ──────────────────────────────────────────
             data = resp.get("data") if isinstance(resp, dict) else None
             if data and isinstance(data, dict) and "order_id" in data:
                 return data
 
-            # Check for retryable status
+            # ── Extract error info ────────────────────────────────────
             sc  = resp.get("status_code", 0) if isinstance(resp, dict) else 0
             msg = ""
             try:
@@ -243,25 +259,117 @@ class OrderManager:
             except Exception:
                 pass
 
-            if sc in self._RETRY_STATUS_CODES and attempt < self._MAX_RETRIES - 1:
-                if sc == 429:
-                    GlobalRateLimiter.notify_429()
-                sleep = self._RETRY_BASE_SLEEP * (2 ** attempt)
+            # ── 429: rate limit backoff ────────────────────────────────
+            if sc == 429:
+                GlobalRateLimiter.notify_429()
+                sleep = self._RETRY_BASE_SLEEP * (2 ** min(attempt, 4))
+                logger.warning(f"429 rate limit on attempt {attempt + 1}, "
+                               f"backing off {sleep:.1f}s")
+                time.sleep(sleep)
+                attempt += 1
+                continue
+
+            # ── Other transient server errors ─────────────────────────
+            if sc in self._RETRY_STATUS_CODES:
+                sleep = self._RETRY_BASE_SLEEP * (2 ** min(attempt, 4))
                 logger.warning(f"Transient error {sc} on attempt {attempt + 1}, "
                                f"retry in {sleep:.1f}s: {msg}")
                 time.sleep(sleep)
+                attempt += 1
                 continue
 
-            # 401 = auth failure — fail immediately, no retries
+            # ── 401: potentially spurious auth failure ─────────────────
             if sc == 401:
-                logger.error(f"Authentication failure (401) — not retrying: {msg}")
+                consecutive_401s += 1
+                if consecutive_401s <= self._MAX_401_RETRIES:
+                    delay = self._401_RETRY_DELAY_SEC * consecutive_401s
+                    logger.warning(
+                        f"⚠️ Auth failure (401) attempt {consecutive_401s}/"
+                        f"{self._MAX_401_RETRIES} — retrying in {delay:.0f}s. "
+                        f"Msg: {msg}"
+                    )
+                    time.sleep(delay)
+                    attempt += 1
+                    continue
+                # Exhausted 401 retries
+                logger.error(
+                    f"🔐 Authentication failure (401) persists after "
+                    f"{self._MAX_401_RETRIES} retries — giving up. Msg: {msg}"
+                )
                 return None
 
-            logger.error(f"place_order permanent failure (attempt {attempt + 1}): "
-                         f"status={sc} msg={msg}")
+            # ── Exhausted normal retries ──────────────────────────────
+            if attempt >= self._MAX_RETRIES - 1:
+                logger.error(f"place_order permanent failure after {attempt + 1} "
+                             f"attempts: status={sc} msg={msg}")
+                return None
+
+            logger.warning(f"place_order non-retryable failure (attempt {attempt + 1}): "
+                           f"status={sc} msg={msg}")
             return None
 
-        logger.error(f"place_order failed after {self._MAX_RETRIES} attempts")
+        logger.error(f"place_order exhausted all attempts ({total_attempts})")
+        return None
+
+    def place_order_guaranteed(
+        self,
+        order_fn_name: str,
+        max_wait_seconds: float = 600.0,
+        retry_interval_base: float = 15.0,
+        **kwargs,
+    ) -> Optional[Dict]:
+        """
+        Guaranteed-delivery wrapper: keeps retrying order_fn until it succeeds,
+        the caller cancels (via the returned stop_event), or max_wait_seconds elapses.
+
+        Args:
+            order_fn_name:      Name of the method to call ('place_take_profit',
+                                'place_stop_loss', 'place_limit_order', etc.)
+            max_wait_seconds:   Hard ceiling on total retry time.
+            retry_interval_base: Base sleep between retries (doubles each time, capped at 60s).
+            **kwargs:           Forwarded to the named method.
+
+        Returns:
+            Order data dict on first success, or None if max_wait_seconds exceeded.
+
+        Usage (fire-and-forget from a thread):
+            result = order_manager.place_order_guaranteed(
+                'place_take_profit', side='SELL', quantity=0.008, trigger_price=74281.0)
+        """
+        fn = getattr(self, order_fn_name, None)
+        if fn is None:
+            logger.error(f"place_order_guaranteed: unknown method '{order_fn_name}'")
+            return None
+
+        deadline   = time.time() + max_wait_seconds
+        attempt    = 0
+        sleep_time = retry_interval_base
+
+        while time.time() < deadline:
+            attempt += 1
+            result = fn(**kwargs)
+            if result and "error" not in result:
+                logger.info(f"✅ place_order_guaranteed: {order_fn_name} succeeded "
+                            f"on attempt {attempt}")
+                return result
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+
+            actual_sleep = min(sleep_time, remaining, 60.0)
+            logger.warning(
+                f"⏳ place_order_guaranteed: {order_fn_name} attempt {attempt} "
+                f"failed — retrying in {actual_sleep:.0f}s "
+                f"({remaining:.0f}s remaining)"
+            )
+            time.sleep(actual_sleep)
+            sleep_time = min(sleep_time * 1.5, 60.0)  # cap at 60s
+
+        logger.error(
+            f"❌ place_order_guaranteed: {order_fn_name} FAILED after "
+            f"{attempt} attempts / {max_wait_seconds:.0f}s window"
+        )
         return None
 
     def _record_order(self, order_id: str, meta: Dict):

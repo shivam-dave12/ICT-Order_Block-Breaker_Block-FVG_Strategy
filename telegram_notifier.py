@@ -34,11 +34,53 @@ _worker_lock    = threading.Lock()
 _MIN_INTERVAL   = 1.0
 _MAX_RETRIES    = 3
 
-def _esc(s) -> str:
-    """Escape <, >, & for Telegram HTML parse_mode."""
-    if s is None:
-        return ""
-    return _html_lib.escape(str(s), quote=False)
+def _sanitize_html(text: str) -> str:
+    """
+    Remove or escape HTML constructs that Telegram's HTML parse_mode rejects.
+
+    Telegram supports only: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">,
+    <tg-spoiler>, and their closing counterparts.  Any other tag (including empty
+    tags like <> or unknown tags like <br>, <hr>, <p>) raises a 400 parse error.
+
+    Strategy:
+      1. Replace <br> / <br/> with a newline (most common culprit).
+      2. Strip any remaining unsupported tags while preserving their inner text.
+      3. Collapse runs of blank lines to at most two consecutive newlines.
+    """
+    import re
+
+    # Common safe substitutions
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<hr\s*/?>', '\n──────\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<p\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'</p>', '', text, flags=re.IGNORECASE)
+
+    # Supported tags — keep these intact
+    _SAFE_TAGS = {
+        'b', '/b', 'i', '/i', 'u', '/u', 's', '/s',
+        'code', '/code', 'pre', '/pre',
+        'tg-spoiler', '/tg-spoiler',
+    }
+
+    def _fix_tag(m):
+        inner = m.group(1).strip()
+        # Keep <a href="..."> and </a>
+        if inner.lower().startswith('a ') or inner.lower() == '/a':
+            return m.group(0)
+        # Keep safe tags
+        tag_name = inner.lower().split()[0] if inner else ''
+        if tag_name in _SAFE_TAGS:
+            return m.group(0)
+        # Strip unsupported tag (keep its text content if any)
+        return ''
+
+    text = re.sub(r'<([^>]*)>', _fix_tag, text)
+
+    # Collapse excessive blank lines (> 2 consecutive newlines → 2)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text
+
+
 
 
 def _send_worker():
@@ -69,16 +111,44 @@ def _send_worker():
 
             try:
                 url = f"https://api.telegram.org/bot{telegram_config.TELEGRAM_BOT_TOKEN}/sendMessage"
+
+                # Sanitize HTML before sending to prevent "Unsupported start tag" 400s
+                send_text = message[:4000]
+                send_mode = parse_mode
+                if parse_mode == "HTML":
+                    send_text = _sanitize_html(send_text)
+
                 payload = {
                     "chat_id": telegram_config.TELEGRAM_CHAT_ID,
-                    "text": message[:4000],
-                    "parse_mode": parse_mode,
+                    "text": send_text,
+                    "parse_mode": send_mode,
                     "disable_web_page_preview": True,
                 }
                 resp = requests.post(url, json=payload, timeout=15)
                 last_send_ts = time.time()
 
                 if resp.status_code == 200:
+                    break
+
+                # 400 parse error — retry once without parse_mode (plain text)
+                if resp.status_code == 400 and parse_mode == "HTML" and attempt == 0:
+                    logger.warning(
+                        f"Telegram HTML parse error — retrying as plain text: {resp.text[:120]}"
+                    )
+                    import re as _re
+                    plain_text = _re.sub(r'<[^>]+>', '', send_text)
+                    plain_payload = {
+                        "chat_id": telegram_config.TELEGRAM_CHAT_ID,
+                        "text": plain_text[:4000],
+                        "disable_web_page_preview": True,
+                    }
+                    resp2 = requests.post(url, json=plain_payload, timeout=15)
+                    last_send_ts = time.time()
+                    if resp2.status_code == 200:
+                        break
+                    logger.warning(
+                        f"Telegram plain-text fallback also failed: {resp2.status_code}"
+                    )
                     break
 
                 # Retryable errors

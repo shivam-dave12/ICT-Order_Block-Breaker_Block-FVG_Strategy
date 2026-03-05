@@ -425,6 +425,15 @@ class AdvancedICTStrategy:
 
         self._initialized = False
         self._trade_side: Optional[str] = None
+
+        # ── TP Guardian ─────────────────────────────────────────────────────
+        # Background thread that keeps retrying TP placement until it succeeds
+        # or the position closes.  Ensures we NEVER stay in a position without
+        # a TP order on the exchange, even after repeated API failures.
+        self._tp_guardian_active: bool = False
+        self._tp_guardian_stop:   threading.Event = threading.Event()
+        self._tp_guardian_thread: Optional[threading.Thread] = None
+
         logger.info("✅ AdvancedICTStrategy v10 created (single TP/SL, structure trailing)")
 
     # ==================================================================
@@ -930,7 +939,7 @@ class AdvancedICTStrategy:
             reward = abs(tp_price - entry_price)
             rr = reward / risk if risk > 0 else 0
 
-            plan["status"] = "READY" if rr >= config.MIN_RISK_REWARD_RATIO else "LOW_RR"
+            plan["status"] = "READY" if rr >= config.MIN_RISK_REWARD_RATIO - 1e-9 else "LOW_RR"
             plan["entry"] = entry_price
             plan["sl"] = sl_price
             plan["tp"] = tp_price
@@ -958,7 +967,7 @@ class AdvancedICTStrategy:
             if "tp_reason" not in plan:
                 plan["tp_reason"] = "opposing structure"
 
-            if rr < config.MIN_RISK_REWARD_RATIO:
+            if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
                 plan["gate_failed"] = f"RR {rr:.1f}x (min {config.MIN_RISK_REWARD_RATIO}x)"
 
             return plan
@@ -2360,8 +2369,8 @@ class AdvancedICTStrategy:
             reward = abs(tp_price - entry_price)
             rr     = reward / risk if risk > 0 else 0
 
-            if rr < config.MIN_RISK_REWARD_RATIO:
-                logger.warning(f"⚠️ RR={rr:.2f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
+            if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
+                logger.warning(f"⚠️ RR={rr:.4f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
                 return
 
             # Position size
@@ -2736,8 +2745,10 @@ class AdvancedICTStrategy:
                     self.tp_order_id = tp_result.get("data", {}).get("order_id") or tp_result.get("order_id")
                     logger.info(f"✅ TP placed on fill: {self.tp_order_id} @ ${self.current_tp_price:,.2f} qty={actual_qty}")
                 else:
-                    logger.error(f"❌ TP placement failed on fill: {tp_result} — retrying via _replace_tp_order")
+                    logger.error(f"❌ TP placement failed on fill: {tp_result} — launching TP Guardian")
                     side_str = "long" if side == "LONG" else "short"
+                    # Try _replace_tp_order first (3 immediate attempts); on exhaustion it
+                    # will automatically launch the persistent guardian
                     self._replace_tp_order(order_manager, self.current_tp_price, side_str, qty=actual_qty)
 
             # Transition to active position
@@ -3383,17 +3394,11 @@ class AdvancedICTStrategy:
 
     def _replace_tp_order(self, order_manager, new_tp: float, side: str,
                           qty: float = None) -> bool:
-        """Cancel existing TP and place a new one.  Returns True on success.
+        """Cancel existing TP and place a new one.  Returns True on immediate success.
 
         Unlike _replace_sl_order, a TP failure is NOT an emergency —
-        the SL still protects capital.  But we do retry MAX_TP_RETRIES
-        times before giving up and alerting via Telegram.
-
-        Args:
-            order_manager: OrderManager instance
-            new_tp:        New trigger price for the TP order
-            side:          Position side ("long" or "short")
-            qty:           Quantity override; defaults to self.entry_quantity
+        the SL still protects capital.  On exhausted retries, a TP Guardian
+        background thread is launched that keeps trying indefinitely.
         """
         MAX_TP_RETRIES = 3
         tp_side = "SELL" if side == "long" else "BUY"
@@ -3404,7 +3409,10 @@ class AdvancedICTStrategy:
         old_tp_id = self.tp_order_id
 
         try:
-            # ── Step 1: Cancel existing TP if present ─────────────────
+            # ── Step 1: Stop any running guardian (TP price may have changed) ──
+            self._stop_tp_guardian()
+
+            # ── Step 2: Cancel existing TP if present ─────────────────
             if old_tp_id:
                 GlobalRateLimiter.wait()
                 cancel_result = order_manager.cancel_order(old_tp_id)
@@ -3416,12 +3424,9 @@ class AdvancedICTStrategy:
                         f"position closed, not placing new TP"
                     )
                     return False   # caller should treat position as closed
-                # SUCCESS / NOT_FOUND / FAILED — proceed to place new TP
-                # (FAILED: old TP may still be live; new TP might duplicate
-                #  but exchange will reject the second reduce_only if full)
                 self.tp_order_id = None
 
-            # ── Step 2: Place new TP with retry ───────────────────────
+            # ── Step 3: Place new TP (immediate attempts) ─────────────
             for attempt in range(MAX_TP_RETRIES):
                 GlobalRateLimiter.wait()
                 result = order_manager.place_take_profit(
@@ -3431,34 +3436,38 @@ class AdvancedICTStrategy:
                     self.tp_order_id = (result.get("data", {}).get("order_id")
                                         or result.get("order_id"))
                     logger.info(
-                        f"✅ TP {'placed' if not old_tp_id else 'replaced'} → "
+                        f"\u2705 TP {'placed' if not old_tp_id else 'replaced'} \u2192 "
                         f"{self.tp_order_id} @ ${new_tp:,.2f} qty={use_qty}"
                     )
                     return True
 
                 logger.warning(
-                    f"⚠️ TP placement attempt {attempt + 1}/{MAX_TP_RETRIES} "
+                    f"\u26a0\ufe0f TP placement attempt {attempt + 1}/{MAX_TP_RETRIES} "
                     f"failed: {result}"
                 )
                 if attempt < MAX_TP_RETRIES - 1:
-                    time.sleep(3.0 * (attempt + 1))
+                    time.sleep(6.0 * (attempt + 1))   # 6s, 12s
 
-            # All retries exhausted
+            # ── Step 4: Immediate retries exhausted — hand off to guardian ──
             logger.error(
-                f"❌ TP placement failed after {MAX_TP_RETRIES} attempts "
-                f"@ ${new_tp:,.2f}. SL still active — capital protected "
-                f"but profit target unset."
+                f"\u274c TP placement failed after {MAX_TP_RETRIES} immediate attempts "
+                f"@ ${new_tp:,.2f}. Launching TP Guardian — SL still protects capital."
             )
             send_telegram_message(
-                f"⚠️ <b>TP PLACEMENT FAILED</b>\n"
-                f"Tried {MAX_TP_RETRIES}× @ ${new_tp:,.2f}\n"
-                f"SL is still active at ${self.current_sl_price:,.2f}.\n"
-                f"Position will rely on SL + trailing only."
+                f"\u26a0\ufe0f <b>TP PLACEMENT DELAYED</b>\n"
+                f"Tried {MAX_TP_RETRIES}x @ ${new_tp:,.2f}\n"
+                f"SL active at ${self.current_sl_price:,.2f}\n"
+                f"\U0001f6e1\ufe0f TP Guardian launched — retrying in background..."
             )
+            self._start_tp_guardian(order_manager, new_tp, side, use_qty)
             return False
 
         except Exception as e:
-            logger.error(f"❌ _replace_tp_order error: {e}", exc_info=True)
+            logger.error(f"\u274c _replace_tp_order error: {e}", exc_info=True)
+            try:
+                self._start_tp_guardian(order_manager, new_tp, side, use_qty)
+            except Exception:
+                pass
             return False
 
     def _verify_sl_tp_health(self, order_manager) -> None:
@@ -3653,10 +3662,13 @@ class AdvancedICTStrategy:
 
             elif self.state == "POSITION_ACTIVE":
                 # No TP order ID but position is active — re-place
-                logger.warning("⚠️ No TP order ID for active position — re-placing")
-                side_str = "long" if side == "long" else "short"
-                self._replace_tp_order(order_manager, self.current_tp_price,
-                                       side_str, qty=qty)
+                if self._tp_guardian_active:
+                    logger.debug("No TP order ID but guardian is already running — skipping health re-place")
+                else:
+                    logger.warning("⚠️ No TP order ID for active position — re-placing")
+                    side_str = "long" if side == "long" else "short"
+                    self._replace_tp_order(order_manager, self.current_tp_price,
+                                           side_str, qty=qty)
 
         except Exception as e:
             logger.error(f"❌ SL/TP health check error: {e}", exc_info=True)
@@ -3849,10 +3861,119 @@ class AdvancedICTStrategy:
             logger.error(f"❌ Position close handler error: {e}", exc_info=True)
 
     # ==================================================================
+    # TP GUARDIAN — background persistent TP placement
+    # ==================================================================
+
+    def _start_tp_guardian(
+        self,
+        order_manager,
+        tp_price: float,
+        side: str,
+        qty: float,
+    ) -> None:
+        """
+        Launch a daemon thread that keeps retrying TP placement until it either
+        succeeds or the position closes.
+
+        Design:
+          • If a guardian is already running, stop it and start a fresh one
+            (e.g. TP price changed due to trailing).
+          • Exponential back-off: 15s → 22s → 33s … capped at 120s.
+          • Stops automatically when:
+              - TP order is successfully placed (self.tp_order_id is set), OR
+              - Position is no longer active (state != "POSITION_ACTIVE"), OR
+              - Stop event is signalled externally.
+          • Never raises; all exceptions are caught and logged.
+        """
+        # Stop any existing guardian first
+        self._stop_tp_guardian()
+
+        self._tp_guardian_stop.clear()
+        self._tp_guardian_active = True
+
+        tp_side = "SELL" if side == "long" else "BUY"
+
+        def _guardian_worker():
+            attempt    = 0
+            sleep_time = 15.0
+            try:
+                while not self._tp_guardian_stop.is_set():
+                    # Exit conditions: position gone or TP already placed
+                    if self.state != "POSITION_ACTIVE":
+                        logger.info("TP Guardian: position no longer active — stopping")
+                        break
+                    if self.tp_order_id:
+                        logger.info(f"TP Guardian: TP already placed "
+                                    f"({self.tp_order_id}) — stopping")
+                        break
+
+                    attempt += 1
+                    logger.info(f"🔄 TP Guardian attempt {attempt} — "
+                                f"placing TP @ ${tp_price:,.2f} qty={qty}")
+
+                    result = order_manager.place_take_profit(
+                        side=tp_side, quantity=qty, trigger_price=tp_price)
+
+                    if result and "error" not in result:
+                        order_id = (result.get("data", {}).get("order_id")
+                                    or result.get("order_id"))
+                        if order_id:
+                            self.tp_order_id = order_id
+                            logger.info(
+                                f"✅ TP Guardian: TP secured "
+                                f"{order_id} @ ${tp_price:,.2f} "
+                                f"(attempt {attempt})"
+                            )
+                            from telegram_notifier import send_telegram_message
+                            send_telegram_message(
+                                f"✅ <b>TP SECURED</b> (Guardian attempt {attempt})\n"
+                                f"Order: <code>{order_id}</code>\n"
+                                f"Price: ${tp_price:,.2f}\n"
+                                f"SL still active at ${self.current_sl_price:,.2f}"
+                            )
+                            break
+                    else:
+                        logger.warning(
+                            f"⚠️ TP Guardian attempt {attempt} failed: {result} — "
+                            f"retrying in {sleep_time:.0f}s"
+                        )
+
+                    # Wait with stop-event awareness
+                    self._tp_guardian_stop.wait(timeout=sleep_time)
+                    sleep_time = min(sleep_time * 1.5, 120.0)   # cap at 2 min
+
+            except Exception as e:
+                logger.error(f"❌ TP Guardian crashed: {e}", exc_info=True)
+            finally:
+                self._tp_guardian_active = False
+                logger.info("TP Guardian thread exited")
+
+        self._tp_guardian_thread = threading.Thread(
+            target=_guardian_worker,
+            name="tp-guardian",
+            daemon=True,
+        )
+        self._tp_guardian_thread.start()
+        logger.info(
+            f"🛡️ TP Guardian started — will keep retrying TP @ "
+            f"${tp_price:,.2f} until placed or position closes"
+        )
+
+    def _stop_tp_guardian(self) -> None:
+        """Signal and join the TP guardian thread (non-blocking — join with 2s timeout)."""
+        if self._tp_guardian_thread and self._tp_guardian_thread.is_alive():
+            self._tp_guardian_stop.set()
+            self._tp_guardian_thread.join(timeout=2.0)
+        self._tp_guardian_active = False
+        self._tp_guardian_stop.clear()
+        self._tp_guardian_thread = None
+
+    # ==================================================================
     # UTILITIES
     # ==================================================================
 
     def _reset_position_state(self) -> None:
+        self._stop_tp_guardian()                    # ← stop guardian on position close
         self.state                   = "READY"
         self.active_position         = None
         self.entry_order_id          = None
