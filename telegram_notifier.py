@@ -143,7 +143,8 @@ def _send_worker():
                         f"Telegram HTML parse error — retrying as plain text: {resp.text[:120]}"
                     )
                     import re as _re
-                    plain_text = _re.sub(r'<[^>]+>', '', send_text)
+                    # DOTALL: strip tags that span multiple lines (e.g. logged tracebacks)
+                    plain_text = _re.sub(r'<[^>]+>', '', send_text, flags=_re.DOTALL)
                     plain_payload = {
                         "chat_id": telegram_config.TELEGRAM_CHAT_ID,
                         "text": plain_text[:4000],
@@ -998,7 +999,10 @@ class TelegramLogHandler(logging.Handler):
                 self._buffer.clear()
                 msg = "\n".join(buffered) + "\n" + msg
 
-            send_telegram_message(f"⚠️ <code>{msg[:1500]}</code>")
+            # CRITICAL: escape content so log messages containing <, >, &
+            # (from exception reprs, Python type names, f-strings with dicts, etc.)
+            # do not break Telegram's HTML parser.
+            send_telegram_message(f"⚠️ <code>{_esc(msg[:1500])}</code>")
         except Exception:
             pass
 

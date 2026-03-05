@@ -426,6 +426,17 @@ class AdvancedICTStrategy:
         self._initialized = False
         self._trade_side: Optional[str] = None
 
+        # ── Post-CHoCH directional block ──────────────────────────────────────
+        # After a CHoCH forces position close, same-direction entries are blocked
+        # until the market forms a fresh MSS in that direction (or 30-min minimum).
+        # This prevents immediately re-entering the direction that just failed.
+        self._choch_invalidated_side: Optional[str] = None
+        self._choch_block_expires_ms: int           = 0
+        # Timestamp of the original CHoCH that set the block (used for MSS lookback)
+        self._choch_ts: int                         = 0
+        _CHOCH_BLOCK_DURATION_MS                    = 30 * 60 * 1000  # 30-min window
+        self._CHOCH_BLOCK_DURATION_MS: int          = _CHOCH_BLOCK_DURATION_MS
+
         # ── TP Guardian ─────────────────────────────────────────────────────
         # Background thread that keeps retrying TP placement until it succeeds
         # or the position closes.  Ensures we NEVER stay in a position without
@@ -876,6 +887,23 @@ class AdvancedICTStrategy:
         plan: Dict = {"side": side, "status": "EVALUATING"}
 
         try:
+            # ── Risk gate check (mirror what _evaluate_entry does) ────────────
+            # Checked FIRST so the outlook accurately reflects actual tradability.
+            # Without this, the log can show "READY" while can_trade() blocks.
+            if self._risk_manager is not None:
+                can, risk_reason = self._risk_manager.can_trade()
+                if not can:
+                    plan["status"] = "BLOCKED_RISK"
+                    plan["gate_failed"] = f"RiskMgr: {risk_reason}"
+                    return plan
+
+            # ── Placement lock check ──────────────────────────────────────────
+            if self.state == "READY" and now_ms < self._placement_locked_until:
+                remaining_s = (self._placement_locked_until - now_ms) / 1000
+                plan["status"] = "PLACEMENT_LOCKED"
+                plan["gate_failed"] = f"Placement locked {remaining_s:.0f}s remaining"
+                return plan
+
             # L1 Gate
             l1_pass, l1_reason = self._cascade_l1(side, current_price, now_ms)
             if not l1_pass:
@@ -1776,6 +1804,37 @@ class AdvancedICTStrategy:
         FVGs/OBs before continuing. Allow counter-trend retracement trades
         targeting those FVG fills — this IS the institutional model.
         """
+        # ── Post-CHoCH directional block (checked before ALL other gates) ───────
+        # After a CHoCH-forced close, re-entering the same direction is forbidden
+        # until the block expires AND a fresh MSS in that direction has formed.
+        if self._choch_invalidated_side == side:
+            if now < self._choch_block_expires_ms:
+                remaining_min = (self._choch_block_expires_ms - now) / 60_000
+                return False, (
+                    f"Post-CHoCH {side.upper()} block active — "
+                    f"{remaining_min:.0f}m remaining. Await new liquidity sweep."
+                )
+            # Block timer expired — require at least one fresh BOS/CHoCH in the
+            # same direction formed AFTER the original CHoCH event.
+            required_dir = "bullish" if side == "long" else "bearish"
+            has_fresh_mss = any(
+                ms.direction == required_dir
+                and ms.timestamp > self._choch_ts
+                for ms in list(self.market_structures)[-20:]
+            )
+            if has_fresh_mss:
+                logger.info(
+                    f"✅ Post-CHoCH {side.upper()} block cleared — "
+                    f"fresh {required_dir.upper()} MSS confirmed"
+                )
+                self._choch_invalidated_side = None  # block lifted
+            else:
+                return False, (
+                    f"Post-CHoCH {side.upper()} — timer expired but no fresh "
+                    f"{required_dir.upper()} BOS/CHoCH since the CHoCH. "
+                    f"Await new structure to restart ICT cycle."
+                )
+
         # ── RETRACEMENT OVERRIDE ──────────────────────────────────────────
         # After displacement, allow retracement trades targeting FVG fills
         if self._is_retracement_trade(side):
@@ -2209,17 +2268,17 @@ class AdvancedICTStrategy:
                             tp_price = dr.high - buffer
 
                 if tp_price is None:
-                    # FALLBACK: Use fixed risk-multiple when no structural TP meets RR
-                    # 2.0x risk is the minimum viable TP — still profitable
-                    fallback_tp = entry_price + risk * 2.0
-                    tp_price = fallback_tp
-                    if not quiet:
-                        logger.info(f"📐 LONG TP fallback: 2.0R @ ${tp_price:,.0f} "
-                                    f"(no structural TP met {config.MIN_RISK_REWARD_RATIO}R)")
-
-                if tp_price is None:
-                    if not quiet: logger.warning("No valid TP structure for LONG — rejecting")
-                    return None, None, None
+                    # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
+                    # If CVD opposes the trade or extension < MIN_RR → reject outright.
+                    tp_price = self._calculate_fibonacci_tp(
+                        "long", entry_price, risk, current_time)
+                    if tp_price is None:
+                        if not quiet:
+                            logger.warning(
+                                "No structural or Fibonacci TP for LONG "
+                                "(no structural level met RR, CVD not aligned) — rejecting"
+                            )
+                        return None, None, None
 
             else:  # short
                 entry_price = current_price + entry_offset
@@ -2301,16 +2360,17 @@ class AdvancedICTStrategy:
                             tp_price = dr.low + buffer
 
                 if tp_price is None:
-                    # FALLBACK: Use fixed risk-multiple when no structural TP meets RR
-                    fallback_tp = entry_price - risk * 2.0
-                    tp_price = fallback_tp
-                    if not quiet:
-                        logger.info(f"📐 SHORT TP fallback: 2.0R @ ${tp_price:,.0f} "
-                                    f"(no structural TP met {config.MIN_RISK_REWARD_RATIO}R)")
-
-                if tp_price is None:
-                    if not quiet: logger.warning("No valid TP structure for SHORT — rejecting")
-                    return None, None, None
+                    # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
+                    # If CVD opposes the trade or extension < MIN_RR → reject outright.
+                    tp_price = self._calculate_fibonacci_tp(
+                        "short", entry_price, risk, current_time)
+                    if tp_price is None:
+                        if not quiet:
+                            logger.warning(
+                                "No structural or Fibonacci TP for SHORT "
+                                "(no structural level met RR, CVD not aligned) — rejecting"
+                            )
+                        return None, None, None
 
             # Round to tick
             entry_price = round(entry_price / tick) * tick
@@ -2322,6 +2382,82 @@ class AdvancedICTStrategy:
         except Exception as e:
             logger.error(f"❌ Level calculation error: {e}", exc_info=True)
             return None, None, None
+
+    # ==================================================================
+    # FIBONACCI EXTENSION TP — CVD-Weighted
+    # Used when no structural TP (EQH/OB/swing/DR) meets MIN_RISK_REWARD_RATIO.
+    # Fibonacci extensions of the initial risk are the canonical ICT alternative
+    # to structural targets. CVD conviction determines which extension to use.
+    # ==================================================================
+
+    def _calculate_fibonacci_tp(
+        self,
+        side         : str,
+        entry_price  : float,
+        risk         : float,
+        current_time : int,
+    ) -> Optional[float]:
+        """
+        Fibonacci extension TP — NO fixed fallback, NO synthetic price.
+
+        Extension level is selected by CVD signal strength and direction
+        alignment.  If CVD OPPOSES the trade direction, return None — a trade
+        against volume flow has no Fibonacci justification and is rejected.
+
+        Fibonacci multiples used:
+          STRONG_BULL / STRONG_BEAR  → 2.618R  (full ICT impulse extension)
+          BULL / BEAR                → 1.618R  (golden ratio — most common target)
+          NEUTRAL                    → 1.272R  (conservative — smallest valid ext.)
+
+        Returns None (→ trade rejected) when:
+          • CVD opposes side
+          • Computed extension < MIN_RISK_REWARD_RATIO
+          • risk ≤ 0 (invalid setup)
+        """
+        if risk <= 0:
+            return None
+
+        cvd        = self.volume_analyzer.get_cvd_signal()
+        cvd_signal = cvd.get("signal", "NEUTRAL")
+
+        # Reject if CVD actively opposes the trade — no confluence for extension
+        if side == "long"  and "BEAR" in cvd_signal:
+            logger.debug(f"Fibonacci TP rejected: CVD={cvd_signal} opposes LONG")
+            return None
+        if side == "short" and "BULL" in cvd_signal:
+            logger.debug(f"Fibonacci TP rejected: CVD={cvd_signal} opposes SHORT")
+            return None
+
+        # Select extension by conviction level
+        if "STRONG" in cvd_signal:
+            fib_mult = 2.618
+            fib_label = "2.618 (strong CVD)"
+        elif cvd_signal != "NEUTRAL":
+            fib_mult = 1.618
+            fib_label = "1.618 (aligned CVD)"
+        else:
+            fib_mult = 1.272
+            fib_label = "1.272 (neutral CVD)"
+
+        # Must meet minimum RR even after applying the extension
+        if fib_mult < config.MIN_RISK_REWARD_RATIO - 1e-9:
+            logger.debug(
+                f"Fibonacci TP rejected: extension {fib_mult:.3f}x "
+                f"< MIN_RR {config.MIN_RISK_REWARD_RATIO}")
+            return None
+
+        tick = config.TICK_SIZE
+        if side == "long":
+            tp = entry_price + risk * fib_mult
+        else:
+            tp = entry_price - risk * fib_mult
+
+        tp = round(tp / tick) * tick
+        logger.info(
+            f"📐 Fibonacci TP [{side.upper()}] @ ${tp:,.1f} "
+            f"— {fib_label} | CVD={cvd_signal} | mult={fib_mult:.3f}"
+        )
+        return tp
 
     # ==================================================================
     # EXECUTE ENTRY
@@ -2770,6 +2906,25 @@ class AdvancedICTStrategy:
 
         except Exception as e:
             logger.error(f"❌ Entry fill handler error: {e}", exc_info=True)
+            # If an exception prevented us from reaching state="POSITION_ACTIVE",
+            # the bot is stuck in ENTRY_PENDING indefinitely.  Guard: if state is
+            # still ENTRY_PENDING after the exception, force a reset so the bot
+            # can re-evaluate the market on the next tick.
+            if self.state == "ENTRY_PENDING":
+                logger.critical(
+                    "🚨 _on_entry_filled exception left state=ENTRY_PENDING — "
+                    "forcing reset to READY. Check exchange for orphaned position!"
+                )
+                send_telegram_message(
+                    "🚨 <b>ENTRY FILL ERROR — manual check required</b>\\n"
+                    "Exception in fill handler — state reset to READY.\\n"
+                    f"<code>{str(e)[:200]}</code>\\n"
+                    "Verify exchange for orphaned position/orders."
+                )
+                self._reset_position_state()
+                self._placement_locked_until = (
+                    int(time.time() * 1000) + PLACEMENT_LOCK_SECONDS * 1000
+                )
 
     def _manage_active_position(
         self, data_manager, order_manager,
@@ -2960,6 +3115,29 @@ class AdvancedICTStrategy:
                 )
 
             self._on_position_closed(side, actual_close_price, current_time)
+
+            # ── Post-CHoCH directional block ─────────────────────────────────
+            # Block re-entry in the same direction as the just-closed position.
+            # The CHoCH is structural proof that the trend invalidated — entering
+            # the same direction again immediately is the most common retail trap.
+            # Block persists for _CHOCH_BLOCK_DURATION_MS OR until a fresh MSS
+            # in the same direction confirms a valid new cycle (whichever is later).
+            self._choch_invalidated_side = side
+            self._choch_block_expires_ms = current_time + self._CHOCH_BLOCK_DURATION_MS
+            self._choch_ts               = current_time
+            logger.info(
+                f"⛔ Post-CHoCH block: {side.upper()} entries blocked for "
+                f"{self._CHOCH_BLOCK_DURATION_MS // 60_000}m "
+                f"— requires fresh {('bullish' if side == 'long' else 'bearish').upper()} "
+                f"BOS/CHoCH to clear"
+            )
+            send_telegram_message(
+                f"⛔ <b>Post-CHoCH block: {side.upper()}</b>\\n"
+                f"Same-direction entries blocked for "
+                f"{self._CHOCH_BLOCK_DURATION_MS // 60_000}m.\\n"
+                f"Requires fresh {'bullish' if side == 'long' else 'bearish'} "
+                f"market structure to restart ICT cycle."
+            )
 
         except Exception as e:
             logger.error(f"❌ CHoCH close error: {e}", exc_info=True)
@@ -3855,10 +4033,13 @@ class AdvancedICTStrategy:
                 f"WR: {wr:.1f}%"
             )
 
-            self._reset_position_state()
-
         except Exception as e:
             logger.error(f"❌ Position close handler error: {e}", exc_info=True)
+        finally:
+            # CRITICAL: ALWAYS reset state — even if PnL calculation, Telegram,
+            # record_trade, or format_position_close throws.  Without this the bot
+            # stays stuck in POSITION_ACTIVE forever and never takes new trades.
+            self._reset_position_state()
 
     # ==================================================================
     # TP GUARDIAN — background persistent TP placement
