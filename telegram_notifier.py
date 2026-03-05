@@ -83,6 +83,13 @@ def _sanitize_html(text: str) -> str:
 
 
 
+def _esc(s) -> str:
+    """Escape <, >, & for Telegram HTML parse_mode."""
+    if s is None:
+        return ""
+    return _html_lib.escape(str(s), quote=False)
+
+
 def _send_worker():
     """Background thread that drains the message queue and sends to Telegram.
     
