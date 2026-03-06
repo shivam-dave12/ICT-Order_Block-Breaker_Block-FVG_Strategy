@@ -3149,7 +3149,6 @@ class AdvancedICTStrategy:
 
             # ── CHoCH — full exit check (every trailing interval) ─────────────
             if now_sec - self._last_sl_update_time >= config.TRAILING_SL_CHECK_INTERVAL:
-                self._last_sl_update_time = now_sec          # ← ADD THIS LINE
                 choch_detected = self._detect_choch_against_position(side, current_time)
                 if choch_detected:
                     logger.warning(f"🔴 CHoCH detected against {side.upper()} — closing full position at market")
@@ -3473,7 +3472,10 @@ class AdvancedICTStrategy:
             for ob in self.order_blocks_bear:
                 if not ob.is_active(current_time):
                     continue
-                if ob.low >= current_price:
+                # For SHORT: OB must be ABOVE current price (overhead resistance).
+                # Skip if ob.low is at or below price — price has already cleared through it.
+                # BUG WAS: "ob.low >= current_price" which skipped OBs ABOVE price (the valid ones).
+                if ob.low <= current_price:
                     continue
                 if ob.high >= self.current_sl_price:
                     continue
