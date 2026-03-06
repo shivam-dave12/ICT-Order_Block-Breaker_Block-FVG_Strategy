@@ -1683,6 +1683,117 @@ class AdvancedICTStrategy:
             logger.error(f"Session update error: {e}", exc_info=True)
 
     # ==================================================================
+    # CONFIRMATION CANDLE — Sniper Entry Filter
+    # ==================================================================
+
+    def _check_confirmation_candle(self, side: str, candles_5m: List[Dict],
+                                    ctx: TriggerContext, current_price: float) -> Tuple[bool, str]:
+        """
+        Institutional entry confirmation: require a valid REVERSAL CANDLE
+        to have printed AT the OB/FVG zone within the last 3 bars.
+
+        ICT principle: Institutions leave a footprint. After a liquidity sweep and
+        MSS, price MUST show a clear rejection candle at the OB/FVG BEFORE entry.
+        Entering without this candle = chasing, not institutional alignment.
+
+        For LONG (bullish OB or FVG):
+          • At least one of the last 3 5m candles must satisfy ALL of:
+            1. Candle LOW wicked into the OB/FVG (tested the zone)
+            2. Candle CLOSED BULLISH (close > open)
+            3. Body ratio >= 35% of total range (not a doji — conviction required)
+            4. Close is ABOVE the zone's bottom (accepted back above it)
+          OR: The last candle has an extreme lower wick (≥ 60% of range) into zone.
+
+        For SHORT (bearish OB or FVG):
+          • Mirror: upper wick into zone, bearish close, body >= 35%.
+
+        Returns (True, "CONF_OK") or (False, reason).
+        """
+        if not candles_5m or len(candles_5m) < 3:
+            return False, "Insufficient candles for confirmation check"
+
+        recent = candles_5m[-4:]   # last 4 closed candles (index -1 may be forming)
+
+        # Determine zone boundaries
+        zone_top: Optional[float]    = None
+        zone_bottom: Optional[float] = None
+
+        if ctx.trigger_ob is not None:
+            ob = ctx.trigger_ob
+            zone_bottom = ob.low
+            zone_top    = ob.high
+        elif ctx.trigger_fvg is not None:
+            fvg = ctx.trigger_fvg
+            zone_bottom = fvg.bottom
+            zone_top    = fvg.top
+
+        # If no structural zone, we cannot require a zone-specific candle.
+        # Grant pass only if there's a fresh swing MSS candle (generic reversal).
+        if zone_bottom is None or zone_top is None:
+            if ctx.mss_event is not None:
+                return True, "CONF_MSS_ONLY"
+            return False, "No OB/FVG zone for confirmation candle check"
+
+        zone_size = zone_top - zone_bottom
+
+        if side == "long":
+            for c in reversed(recent[:-1]):   # skip the current (forming) candle
+                try:
+                    o  = float(c['o']); cl = float(c['c'])
+                    h  = float(c['h']); lo = float(c['l'])
+                    rng = h - lo
+                    if rng <= 0:
+                        continue
+
+                    body       = abs(cl - o)
+                    body_ratio = body / rng
+                    lower_wick = (min(o, cl) - lo) / rng
+
+                    # Candle tested the OB/FVG zone
+                    tested_zone = lo <= zone_top   # low entered the zone
+
+                    # Closed bullish with conviction
+                    bullish_close = cl > o and body_ratio >= 0.35
+
+                    # Closed above zone bottom (accepted back above it)
+                    closed_above  = cl >= zone_bottom
+
+                    # Extreme wick alternative (pin bar)
+                    extreme_wick_long = lower_wick >= 0.60 and tested_zone
+
+                    if tested_zone and ((bullish_close and closed_above) or extreme_wick_long):
+                        return True, f"CONF_CANDLE_LONG (body={body_ratio:.0%} wick={lower_wick:.0%})"
+                except Exception:
+                    continue
+
+            return False, f"No bullish confirmation candle at OB/FVG zone ({zone_bottom:.1f}-{zone_top:.1f})"
+
+        else:  # short
+            for c in reversed(recent[:-1]):
+                try:
+                    o  = float(c['o']); cl = float(c['c'])
+                    h  = float(c['h']); lo = float(c['l'])
+                    rng = h - lo
+                    if rng <= 0:
+                        continue
+
+                    body       = abs(cl - o)
+                    body_ratio = body / rng
+                    upper_wick = (h - max(o, cl)) / rng
+
+                    tested_zone   = h >= zone_bottom   # high entered zone
+                    bearish_close = cl < o and body_ratio >= 0.35
+                    closed_below  = cl <= zone_top
+                    extreme_wick_short = upper_wick >= 0.60 and tested_zone
+
+                    if tested_zone and ((bearish_close and closed_below) or extreme_wick_short):
+                        return True, f"CONF_CANDLE_SHORT (body={body_ratio:.0%} wick={upper_wick:.0%})"
+                except Exception:
+                    continue
+
+            return False, f"No bearish confirmation candle at OB/FVG zone ({zone_bottom:.1f}-{zone_top:.1f})"
+
+    # ==================================================================
     # ENTRY EVALUATION — CASCADE GATE SYSTEM
     # ==================================================================
 
@@ -1740,13 +1851,56 @@ class AdvancedICTStrategy:
                 # ── THRESHOLD: Score must meet regime-adjusted threshold ───
                 threshold = self._get_entry_threshold()
                 if score < threshold:
-                    # Spam suppression: only log near-threshold once per minute
                     rej_key = f"BELOW_THRESH_{side}_{score:.0f}"
                     if self._should_log_rejection(side, rej_key, now_ms):
                         logger.info(f"📊 {side.upper()} near threshold: {score:.0f}/{threshold:.0f} "
                                     f"L2=[{', '.join(l2_labels)}] L3=[{', '.join(l3_labels)}] "
                                     f"[{', '.join(reasons[:4])}]")
                     continue
+
+                # ── CONFIRMATION CANDLE GATE (Sniper Filter) ──────────────
+                # Require a rejection candle at the OB/FVG BEFORE entry.
+                # This eliminates entries where price is near a zone but has
+                # not yet shown institutional rejection (the single strongest
+                # win-rate filter in ICT methodology).
+                c5m = data_manager.get_candles("5m") or []
+                conf_ok, conf_reason = self._check_confirmation_candle(
+                    side, c5m, ctx, current_price)
+                if not conf_ok:
+                    rej_key = f"NO_CONF_{side}"
+                    if self._should_log_rejection(side, rej_key, now_ms):
+                        logger.info(
+                            f"⛔ {side.upper()} CONF CANDLE absent: {conf_reason} "
+                            f"— awaiting institutional rejection print at zone"
+                        )
+                    continue
+
+                # ── ATR SL DISTANCE PRE-VALIDATION ────────────────────────
+                # Reject if the closest structural SL anchor is < 0.5 ATR away.
+                # SL too tight = stopped out by normal volatility / noise.
+                atr_now = self._compute_atr_for_trailing(data_manager)
+                if atr_now > 0:
+                    sl_anchor: Optional[float] = None
+                    if ctx.trigger_ob is not None:
+                        sl_anchor = (ctx.trigger_ob.low  if side == "long"
+                                     else ctx.trigger_ob.high)
+                    elif side == "long" and ctx.nearest_swing_low is not None:
+                        sl_anchor = ctx.nearest_swing_low
+                    elif side == "short" and ctx.nearest_swing_high is not None:
+                        sl_anchor = ctx.nearest_swing_high
+
+                    if sl_anchor is not None:
+                        sl_dist    = abs(current_price - sl_anchor)
+                        min_sl_req = atr_now * 0.5
+                        if sl_dist < min_sl_req:
+                            rej_key = f"SL_TIGHT_{side}"
+                            if self._should_log_rejection(side, rej_key, now_ms):
+                                logger.info(
+                                    f"⛔ {side.upper()} SL too tight: "
+                                    f"{sl_dist:.1f} < 0.5×ATR({atr_now:.1f})={min_sl_req:.1f} "
+                                    f"— entry would be stopped by noise"
+                                )
+                            continue
 
                 # ── PASSED ALL GATES — attempt entry ──────────────────────
                 # Only log "PASSED" once per rejection cycle (not every 5s)
@@ -1855,6 +2009,18 @@ class AdvancedICTStrategy:
         if side == "short" and self.htf_bias == "BULLISH":
             return False, "HTF BULLISH blocks short"
 
+        # ── Minimum HTF strength (institutional-grade filter) ─────────────
+        # Weak bias (50-64%) = uncertain market → do NOT trade.
+        # Only strong conviction (≥65%) yields genuinely directional flow.
+        # Retracement trades use a lower bar (45%) because displacement itself
+        # provides the structural conviction.
+        min_strength = 0.45 if self._is_retracement_trade(side) else 0.65
+        if self.htf_bias_strength < min_strength:
+            return False, (
+                f"HTF {self.htf_bias} bias too weak ({self.htf_bias_strength:.0%} "
+                f"< {min_strength:.0%}) — awaiting stronger conviction"
+            )
+
         # ── Post-displacement: don't short at the bottom / long at the top ─
         # If displacement happened in this direction, we're already at the extreme
         if self._displacement_detected:
@@ -1886,48 +2052,80 @@ class AdvancedICTStrategy:
         return True, "L1_OK"
 
     # ==================================================================
-    # CASCADE L2: Need 2 of: Sweep+Disp, OB/FVG touch, MSS
+    # CASCADE L2: Need 2 of: Sweep+Disp(fresh), OB/FVG BODY touch, MSS
     # ==================================================================
 
     def _cascade_l2(self, side: str, price: float, ctx: TriggerContext,
                      now: int) -> Tuple[int, List[str]]:
+        """
+        L2 Gate — institutional confluence.
+
+        Changed from v10:
+        - REMOVED proximity triggers (OB_PROXIMITY / FVG_PROXIMITY).
+          Price must be INSIDE the zone. 0.5% "near" counts were allowing
+          entries with price still in distribution, before any actual test.
+        - SWEEP must be FRESH: < 45 minutes old.  Stale sweeps that happened
+          hours ago do not represent current institutional intent.
+        - SWEEP must produce DISPLACEMENT: wick_rejection=True AND displacement_confirmed=True.
+          A sweep without displacement is just price noise, not institutional action.
+        - MSS must occur AFTER the sweep to prove price accepted the new direction.
+        """
         met = []
 
-        # A. For retracement trades, the displacement itself counts as one L2 trigger
-        #    ICT logic: displacement = BOS + strong impulse = directional conviction
-        #    Requiring sweep+disp ON TOP of the displacement is double-counting
+        # A. Displacement itself counts for retracement trades
         if self._is_retracement_trade(side):
             met.append("DISPLACEMENT")
 
-        # B. Swept liquidity with displacement
-        if ctx.sweep_pool is not None and ctx.sweep_pool.displacement_confirmed:
-            met.append("SWEEP_DISP")
+        # B. Swept liquidity — MUST be fresh AND displaced
+        SWEEP_FRESHNESS_MS = 45 * 60 * 1000   # 45 minutes — institutional relevance window
+        if ctx.sweep_pool is not None:
+            pool = ctx.sweep_pool
+            age_ms = now - pool.sweep_timestamp
+            is_fresh = age_ms <= SWEEP_FRESHNESS_MS
+            has_disp = pool.displacement_confirmed
+            has_wick = pool.wick_rejection
 
-        # C. OB touch — EXPANDED with proximity for when price has moved through
+            if is_fresh and has_disp and has_wick:
+                met.append("SWEEP_DISP_FRESH")
+            elif is_fresh and has_disp:
+                met.append("SWEEP_DISP")
+            elif is_fresh:
+                # Stale or no displacement: does not count as a full trigger
+                pass  # Not counted — sweep without displacement is noise
+
+        # C. OB touch — price must be INSIDE the OB body or OTE zone.
+        #    NO proximity. Price must have actually tested the level.
         if ctx.trigger_ob is not None:
-            if ctx.trigger_ob.contains_price(price) or ctx.trigger_ob.in_optimal_zone(price):
-                met.append("OB_TOUCH")
-            else:
-                # Price may have already moved through OB — check proximity
-                ob_mid = (ctx.trigger_ob.high + ctx.trigger_ob.low) / 2
-                dist_pct = abs(price - ob_mid) / price * 100 if price > 0 else 999
-                if dist_pct <= 0.5:  # Within 0.5% counts as soft touch
-                    met.append("OB_PROXIMITY")
+            ob = ctx.trigger_ob
+            in_body = ob.contains_price(price)
+            in_ote  = ob.in_optimal_zone(price)
+            if in_body or in_ote:
+                tag = "OB_OTE" if in_ote else "OB_BODY"
+                met.append(tag)
+            # Proximity (within 0.5%) is intentionally NOT counted.
+            # Institutional traders wait for PRICE to BE at the zone.
 
-        # D. FVG touch — EXPANDED with proximity
+        # D. FVG touch — price must be INSIDE the gap.
+        #    NO proximity. Unfilled gap must actually contain current price.
         if ctx.trigger_fvg is not None:
-            if ctx.trigger_fvg.is_price_in_gap(price):
+            fvg = ctx.trigger_fvg
+            if fvg.is_price_in_gap(price):
                 met.append("FVG_TOUCH")
-            elif not any(t.startswith("OB_") for t in met):
-                # Price may have already moved through FVG — check proximity
-                fvg_mid = (ctx.trigger_fvg.top + ctx.trigger_fvg.bottom) / 2
-                dist_pct = abs(price - fvg_mid) / price * 100 if price > 0 else 999
-                if dist_pct <= 0.5:
-                    met.append("FVG_PROXIMITY")
+            # Note: near-FVG proximity NOT counted (see note on OB above)
 
-        # E. Recent MSS in direction
+        # E. Recent MSS in direction — MUST be after the sweep if a sweep exists.
+        #    A MSS that formed before the sweep cannot confirm the new direction.
         if ctx.mss_event is not None:
-            met.append(f"MSS_{ctx.mss_event.structure_type}")
+            ms = ctx.mss_event
+            sweep_ts = ctx.sweep_pool.sweep_timestamp if ctx.sweep_pool else 0
+            if ms.timestamp >= sweep_ts:
+                met.append(f"MSS_{ms.structure_type}")
+            else:
+                # MSS formed before the sweep — old structure, not valid confirmation
+                logger.debug(
+                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
+                    f"({(ms.timestamp - sweep_ts) / 60_000:.0f}m earlier) — not counted"
+                )
 
         return len(met), met
 
@@ -2015,7 +2213,6 @@ class AdvancedICTStrategy:
             for ob in sorted([o for o in obs if o.is_active(now_ms)],
                              key=lambda x: x.strength, reverse=True):
                 virgin_m = ob.virgin_multiplier()
-                dist_pct = abs(current_price - ob.midpoint) / current_price * 100
 
                 if ob.contains_price(current_price) or ob.in_optimal_zone(current_price):
                     in_ote = ob.in_optimal_zone(current_price)
@@ -2031,13 +2228,7 @@ class AdvancedICTStrategy:
                         f"v={ob.visit_count} +{ob_score:.1f}")
                     ctx.trigger_ob = ob
                     break
-                elif dist_pct <= 0.5:
-                    prox = 1.0 - dist_pct / 0.5
-                    ob_score = ob.strength / 100 * 15.0 * prox * virgin_m
-                    score += ob_score
-                    reasons.append(f"Near OB {ob.low:.0f}-{ob.high:.0f} dist={dist_pct:.2f}% +{ob_score:.1f}")
-                    ctx.trigger_ob = ob
-                    break
+                # Proximity scoring intentionally removed — only score OB when price IS inside it
 
             # ── 4. FVG (0-25) ──────────────────────────────────────────
             fvgs = self.fvgs_bull if side == "long" else self.fvgs_bear
@@ -2049,12 +2240,7 @@ class AdvancedICTStrategy:
                     reasons.append(f"IN FVG {fvg.bottom:.0f}-{fvg.top:.0f} fill={fvg.fill_percentage*100:.0f}% +{fvg_score:.1f}")
                     ctx.trigger_fvg = fvg
                     break
-                elif abs(current_price - fvg.midpoint) / current_price * 100 <= 0.5:
-                    fvg_score = 10.0
-                    score += fvg_score
-                    reasons.append(f"Near FVG {fvg.bottom:.0f}-{fvg.top:.0f} +{fvg_score:.1f}")
-                    ctx.trigger_fvg = fvg
-                    break
+                # Proximity scoring intentionally removed — only score FVG when price IS inside it
 
             # ── 5. OB + FVG overlap bonus ──────────────────────────────
             if ctx.trigger_ob and ctx.trigger_fvg:
@@ -2481,14 +2667,15 @@ class AdvancedICTStrategy:
                     logger.info(f"   {r}")
                 logger.info("=" * 80)
 
+            # quiet=True: _calculate_levels logs nothing; outer gate controls spam
             entry_price, sl_price, tp_price = self._calculate_levels(
-                side, current_price, ctx, current_time=current_time)
+                side, current_price, ctx, current_time=current_time, quiet=True)
 
             if entry_price is None:
-                # Spam suppression: only log once per minute
                 rej_key = f"LEVELS_FAIL_{side}"
                 if self._should_log_rejection(side, rej_key, current_time):
-                    logger.warning("⚠️ Structure-based levels failed — no entry")
+                    logger.warning("⚠️ Structure-based levels failed — no entry "
+                                   "(SL or TP could not be derived from market structure)")
                 return
 
             # Sanity validation

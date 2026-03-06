@@ -56,6 +56,9 @@ class RiskManager:
         self.balance_cache_time = 0.0
         self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
 
+        # Daily reset tracking — date-anchored, not trade-count dependent
+        self._last_reset_date = datetime.utcnow().date()
+
         # Shared API (avoid redundant connections)
         if shared_api is not None:
             self.api = shared_api
@@ -313,8 +316,24 @@ class RiskManager:
 
             # ── Consecutive losses ────────────────────────────────────────────
             if self.consecutive_losses >= self.max_consecutive_losses:
-                return False, (f"Max consecutive losses "
-                            f"({self.consecutive_losses})")
+                # Auto-reset after 4 hours: prevents infinite deadlock where
+                # losses block trading → can't trade → can't win → never resets.
+                # After 4h the market context has changed enough to try again.
+                hours_since_last = (now - self.last_trade_time) / 3600
+                AUTO_RESET_HOURS = 4.0
+                if self.last_trade_time > 0 and hours_since_last >= AUTO_RESET_HOURS:
+                    logger.warning(
+                        f"⚠️ Consecutive losses auto-reset: {self.consecutive_losses} losses "
+                        f"but {hours_since_last:.1f}h elapsed (> {AUTO_RESET_HOURS}h). "
+                        f"Market context reset — allowing new evaluation."
+                    )
+                    self.consecutive_losses = 0
+                else:
+                    remaining_h = max(0.0, AUTO_RESET_HOURS - hours_since_last)
+                    return False, (
+                        f"Max consecutive losses ({self.consecutive_losses}) — "
+                        f"auto-reset in {remaining_h:.1f}h or at day boundary"
+                    )
 
             return True, "OK"
 
@@ -417,16 +436,45 @@ class RiskManager:
             )
 
     def _reset_daily_if_needed(self):
-        """Reset daily counters if new UTC day"""
-        now = datetime.utcnow()
-        if not self.daily_trades:
+        """
+        Reset all daily counters when a new UTC calendar day begins.
+
+        CRITICAL BUGS FIXED vs previous version:
+        1. Old code returned immediately if daily_trades was empty — meaning
+           daily_pnl persisted across days when no trades were made, and
+           consecutive_losses was never reset. Both caused infinite gate locks.
+        2. consecutive_losses is now reset at day boundary. The previous version
+           never reset it in daily resets, creating an infinite deadlock:
+           losses → gate locked → can't trade → can't win → gate never unlocks.
+        3. Reset is now DATE-anchored (self._last_reset_date), not dependent
+           on having trade records. Even on days with 0 trades, the reset fires.
+        """
+        today = datetime.utcnow().date()
+
+        if not hasattr(self, '_last_reset_date'):
+            self._last_reset_date = today
             return
 
-        last_trade_time = datetime.fromtimestamp(self.daily_trades[-1].timestamp)
-        if now.date() > last_trade_time.date():
-            logger.info("🔄 New day - resetting daily counters")
-            self.daily_trades = []
-            self.daily_pnl = 0.0
+        if today <= self._last_reset_date:
+            return   # Same day — nothing to reset
+
+        # ── New day detected ──────────────────────────────────────────
+        prev_day        = self._last_reset_date
+        prev_cons_loss  = self.consecutive_losses
+        prev_daily_pnl  = self.daily_pnl
+        prev_n_trades   = len(self.daily_trades)
+
+        self.daily_trades       = []
+        self.daily_pnl          = 0.0
+        self.consecutive_losses = 0   # ← CRITICAL: unlocks the infinite deadlock
+        self._last_reset_date   = today
+
+        logger.info(
+            f"🔄 Daily reset: {prev_day} → {today} | "
+            f"prev daily_pnl=${prev_daily_pnl:+.2f} | "
+            f"prev consecutive_losses={prev_cons_loss} (reset to 0) | "
+            f"prev daily_trades={prev_n_trades}"
+        )
 
     def get_statistics(self) -> Dict:
         """Get comprehensive risk and performance statistics."""
