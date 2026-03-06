@@ -52,7 +52,8 @@ class RiskManager:
 
         # Balance tracking
         self.initial_balance = 0.0
-        self.current_balance = 0.0
+        self.current_balance   = 0.0   # total wallet equity (available + locked)
+        self.available_balance = 0.0   # free margin only — used for position sizing
         self.balance_cache_time = 0.0
         self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
 
@@ -79,7 +80,8 @@ class RiskManager:
             # Return cached balance if still valid
             if now - self.balance_cache_time < self.balance_cache_ttl:
                 return {
-                    "available": self.current_balance,
+                    "available": self.available_balance,   # free margin (for sizing)
+                    "total":     self.current_balance,     # total equity (for % calcs)
                     "cached": True
                 }
 
@@ -92,15 +94,25 @@ class RiskManager:
                 
                 if "error" in balance_data:
                     logger.error(f"Balance fetch error: {balance_data['error']}")
-                    # Return cached balance on error
                     return {
-                        "available": self.current_balance, 
+                        "available": self.available_balance,
+                        "total":     self.current_balance,
                         "cached": True,
                         "error": balance_data['error']
                     }
 
-                # Update balance
-                self.current_balance = float(balance_data.get("available", 0.0))
+                # Two separate balance values:
+                #   available_balance = free margin (exchange: total_available_balance)
+                #   current_balance   = total wallet equity = available + locked
+                #
+                # CRITICAL: daily_loss_pct must divide by TOTAL equity, not free margin.
+                # When a position is open, margin is locked → available shrinks by $46+.
+                # Dividing by ~$31 instead of ~$77 inflates loss % by 2.5x, falsely
+                # blocking new entries while a live position is still open.
+                available = float(balance_data.get("available", 0.0))
+                locked    = float(balance_data.get("locked",    0.0))
+                self.available_balance = available              # free margin (for sizing)
+                self.current_balance   = available + locked     # total equity (for % calcs)
                 self.balance_cache_time = now
 
                 # Set initial balance on first fetch
@@ -109,15 +121,16 @@ class RiskManager:
                     logger.info(f"💰 Initial balance set: ${self.initial_balance:.2f}")
 
                 return {
-                    "available": self.current_balance,
+                    "available": self.available_balance,   # free margin
+                    "total":     self.current_balance,     # total equity
                     "cached": False
                 }
                 
             except Exception as e:
                 logger.error(f"Error fetching balance: {e}", exc_info=True)
-                # Return cached balance on exception
                 return {
-                    "available": self.current_balance, 
+                    "available": self.available_balance,
+                    "total":     self.current_balance,
                     "cached": True,
                     "error": str(e)
                 }
