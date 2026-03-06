@@ -659,17 +659,23 @@ class AdvancedICTStrategy:
                 self.volume_analyzer.on_candle(c5m[-1])
                 self.absorption_model.on_candle(c5m[-1])
 
-            # Swing points
+            # Swing points — ALL timeframes including HTF
             self._detect_swing_points(c5m, current_price, "5m")
             if len(c15m) >= 8:
                 self._detect_swing_points(c15m, current_price, "15m")
             if len(c1h) >= 8:
                 self._detect_swing_points(c1h, current_price, "1h")
+            if len(c4h) >= 8:
+                self._detect_swing_points(c4h, current_price, "4h")
 
-            # Market structure
+            # Market structure — ALL timeframes including HTF
             self._detect_market_structure(c5m, current_price, current_time, "5m")
             if len(c15m) >= 10:
                 self._detect_market_structure(c15m, current_price, current_time, "15m")
+            if len(c1h) >= 10:
+                self._detect_market_structure(c1h, current_price, current_time, "1h")
+            if len(c4h) >= 10:
+                self._detect_market_structure(c4h, current_price, current_time, "4h")
 
             # Order blocks
             self._detect_order_blocks(c5m, current_time, current_price, "5m")
@@ -826,9 +832,21 @@ class AdvancedICTStrategy:
             self._log_trade_plan("SHORT", short_plan, current_price)
             logger.info("=" * 80)
 
-            # ── Send to Telegram on outlook interval ────────────
+            # ── Send CONSOLIDATED report to Telegram on outlook interval ──
             if (now_ms - self._last_outlook_ms) >= self._OUTLOOK_INTERVAL_MS:
                 self._last_outlook_ms = now_ms
+
+                # Gather stats/position data (previously in separate periodic report)
+                stats = self.get_strategy_stats()
+                balance_info = None
+                if self._risk_manager:
+                    try:
+                        balance_info = self._risk_manager.get_available_balance()
+                    except Exception:
+                        pass
+
+                # Regime context
+                rs = self.regime_engine.state
 
                 msg = format_market_outlook(
                     current_price=current_price,
@@ -836,8 +854,8 @@ class AdvancedICTStrategy:
                     htf_bias_strength=self.htf_bias_strength,
                     htf_components=self.htf_bias_components,
                     daily_bias=self.daily_bias,
-                    regime=self.regime_engine.state.regime,
-                    regime_adx=self.regime_engine.state.adx,
+                    regime=rs.regime,
+                    regime_adx=rs.adx,
                     session=self.current_session,
                     in_killzone=self.in_killzone,
                     amd_phase=self.amd_phase,
@@ -855,6 +873,24 @@ class AdvancedICTStrategy:
                     swing_lows=list(self.swing_lows),
                     long_plan=long_plan,
                     short_plan=short_plan,
+                    # ── Consolidated stats (merged from periodic report) ──
+                    balance=balance_info.get("available", 0.0) if balance_info else 0.0,
+                    total_trades=stats.get("total_exits", 0),
+                    win_rate=stats.get("win_rate_pct", 0.0),
+                    daily_pnl=stats.get("daily_pnl", 0.0),
+                    total_pnl=stats.get("total_pnl", 0.0),
+                    consecutive_losses=stats.get("consecutive_losses", 0),
+                    bot_state=self.state,
+                    position=self.get_position(),
+                    current_sl=self.current_sl_price,
+                    current_tp=self.current_tp_price,
+                    entry_price=self.initial_entry_price,
+                    breakeven_moved=self.breakeven_moved,
+                    profit_locked_pct=self.profit_locked_pct,
+                    regime_atr_ratio=rs.atr_ratio,
+                    regime_size_mult=rs.size_multiplier,
+                    volume_delta=data_manager.get_volume_delta(lookback_seconds=300)
+                        if hasattr(data_manager, 'get_volume_delta') else None,
                 )
                 send_telegram_message(msg)
 
@@ -1413,73 +1449,198 @@ class AdvancedICTStrategy:
 
     def _update_htf_bias(self, c4h: List[Dict], c1d: List[Dict],
                           current_price: float) -> None:
+        """
+        Industry-grade HTF bias using multi-component institutional analysis.
+
+        Components (weighted):
+          1. 4H Swing Sequence (30%): Actual confirmed HH/HL vs LL/LH chain
+          2. 4H Market Structure (25%): Recent BOS/CHoCH direction + recency
+          3. 4H EMA Position + Slope (20%): Trend direction & momentum
+          4. 1D Candle Structure (15%): Daily close sequence for macro context
+          5. Price vs Key 4H Levels (10%): Where price sits relative to last major swing
+        """
         try:
             if len(c4h) < 20:
                 return
 
-            closes = [float(c['c']) for c in c4h[-40:]]
-            ema_val = self._calculate_ema(closes, config.HTF_TREND_EMA)
-
-            ema_dist = abs(current_price - ema_val) / ema_val * 100 if ema_val > 0 else 0
-            min_dist = config.HTF_EMA_MIN_DISTANCE
-
-            # Component weights
             bull, bear = 0.0, 0.0
             comp = {}
 
-            # 1. EMA position (30%)
-            if current_price > ema_val:
-                bull += 0.30; comp["ema"] = "BULL"
+            # ── 1. 4H SWING SEQUENCE (30%) ────────────────────────────────
+            # Analyze confirmed 4H swing points for HH/HL or LL/LH patterns
+            htf_highs = sorted(
+                [s for s in self.swing_highs if s.timeframe == "4h" and s.confirmed],
+                key=lambda s: s.timestamp)
+            htf_lows = sorted(
+                [s for s in self.swing_lows if s.timeframe == "4h" and s.confirmed],
+                key=lambda s: s.timestamp)
+
+            swing_bull, swing_bear = 0, 0
+            # Check last 3+ swing highs for HH pattern
+            if len(htf_highs) >= 2:
+                for i in range(-1, max(-len(htf_highs), -4), -1):
+                    if i - 1 >= -len(htf_highs):
+                        if htf_highs[i].price > htf_highs[i - 1].price:
+                            swing_bull += 1  # Higher High
+                        elif htf_highs[i].price < htf_highs[i - 1].price:
+                            swing_bear += 1  # Lower High
+            # Check last 3+ swing lows for HL/LL pattern
+            if len(htf_lows) >= 2:
+                for i in range(-1, max(-len(htf_lows), -4), -1):
+                    if i - 1 >= -len(htf_lows):
+                        if htf_lows[i].price > htf_lows[i - 1].price:
+                            swing_bull += 1  # Higher Low
+                        elif htf_lows[i].price < htf_lows[i - 1].price:
+                            swing_bear += 1  # Lower Low
+
+            total_swing = swing_bull + swing_bear
+            if total_swing > 0:
+                if swing_bull > swing_bear:
+                    bull += 0.30 * (swing_bull / total_swing)
+                    bear += 0.30 * (swing_bear / total_swing)
+                    comp["swing"] = f"HH_HL({swing_bull}/{total_swing})"
+                elif swing_bear > swing_bull:
+                    bear += 0.30 * (swing_bear / total_swing)
+                    bull += 0.30 * (swing_bull / total_swing)
+                    comp["swing"] = f"LL_LH({swing_bear}/{total_swing})"
+                else:
+                    bull += 0.15; bear += 0.15
+                    comp["swing"] = "MIXED"
             else:
-                bear += 0.30; comp["ema"] = "BEAR"
+                # Fallback to raw 4H candle comparison if no confirmed swings
+                if len(c4h) >= 6:
+                    r_highs = [float(c['h']) for c in c4h[-6:]]
+                    r_lows = [float(c['l']) for c in c4h[-6:]]
+                    hh = r_highs[-1] > max(r_highs[:-2]) if len(r_highs) > 2 else False
+                    hl = r_lows[-1] > min(r_lows[:-2]) if len(r_lows) > 2 else False
+                    ll = r_lows[-1] < min(r_lows[:-2]) if len(r_lows) > 2 else False
+                    lh = r_highs[-1] < max(r_highs[:-2]) if len(r_highs) > 2 else False
+                    if hh and hl:
+                        bull += 0.30; comp["swing"] = "HH_HL_raw"
+                    elif ll and lh:
+                        bear += 0.30; comp["swing"] = "LL_LH_raw"
+                    else:
+                        bull += 0.15; bear += 0.15; comp["swing"] = "MIXED_raw"
 
-            # 2. Recent 4H swing structure (30%)
-            recent_ms = [ms for ms in self.market_structures
-                         if ms.timeframe in ("4h", "1h")][-5:]
-            if recent_ms:
-                bull_ms = sum(1 for m in recent_ms if m.direction == "bullish")
-                bear_ms = sum(1 for m in recent_ms if m.direction == "bearish")
-                if bull_ms > bear_ms:
-                    bull += 0.30; comp["ms"] = "BULL"
-                elif bear_ms > bull_ms:
-                    bear += 0.30; comp["ms"] = "BEAR"
+            # ── 2. 4H MARKET STRUCTURE (25%) ──────────────────────────────
+            # Recent BOS/CHoCH on 4H/1H with recency weighting
+            htf_mss = [ms for ms in self.market_structures
+                       if ms.timeframe in ("4h", "1h") and ms.confirmed]
+            recent_htf = htf_mss[-6:] if htf_mss else []
+
+            if recent_htf:
+                # Weight more recent events exponentially
+                w_bull, w_bear, w_total = 0.0, 0.0, 0.0
+                for idx, ms in enumerate(recent_htf):
+                    weight = 1.0 + idx * 0.5  # later = heavier
+                    # CHoCH has more significance than BOS (trend change signal)
+                    if ms.structure_type == "CHoCH":
+                        weight *= 1.5
+                    w_total += weight
+                    if ms.direction == "bullish":
+                        w_bull += weight
+                    else:
+                        w_bear += weight
+
+                if w_total > 0:
+                    bull_r = w_bull / w_total
+                    bear_r = w_bear / w_total
+                    bull += 0.25 * bull_r
+                    bear += 0.25 * bear_r
+
+                last_ms = recent_htf[-1]
+                comp["ms"] = f"{last_ms.structure_type}_{last_ms.direction.upper()[:4]}[{last_ms.timeframe}]"
+            else:
+                bull += 0.125; bear += 0.125
+                comp["ms"] = "NONE"
+
+            # ── 3. 4H EMA POSITION + SLOPE (20%) ─────────────────────────
+            closes_4h = [float(c['c']) for c in c4h[-40:]]
+            ema_val = self._calculate_ema(closes_4h, config.HTF_TREND_EMA)
+
+            # Slope: compare EMA now vs EMA 5 bars ago
+            if len(closes_4h) > 5:
+                ema_prev = self._calculate_ema(closes_4h[:-5], config.HTF_TREND_EMA)
+                ema_slope = (ema_val - ema_prev) / max(ema_prev, 1) * 100
+            else:
+                ema_slope = 0.0
+
+            price_above = current_price > ema_val
+            slope_bull = ema_slope > 0.05   # EMA rising
+            slope_bear = ema_slope < -0.05  # EMA falling
+
+            if price_above and slope_bull:
+                bull += 0.20; comp["ema"] = f"BULL(+{ema_slope:.2f}%)"
+            elif not price_above and slope_bear:
+                bear += 0.20; comp["ema"] = f"BEAR({ema_slope:.2f}%)"
+            elif price_above:
+                bull += 0.12; bear += 0.08; comp["ema"] = f"ABOVE(slope={ema_slope:.2f}%)"
+            elif not price_above:
+                bear += 0.12; bull += 0.08; comp["ema"] = f"BELOW(slope={ema_slope:.2f}%)"
+
+            # ── 4. 1D CANDLE STRUCTURE (15%) ──────────────────────────────
+            if c1d and len(c1d) >= 3:
+                d_closes = [float(c['c']) for c in c1d[-5:]]
+                d_highs = [float(c['h']) for c in c1d[-5:]]
+                d_lows = [float(c['l']) for c in c1d[-5:]]
+
+                # Daily close trend: consecutive higher/lower closes
+                rising_closes = sum(1 for i in range(1, len(d_closes))
+                                    if d_closes[i] > d_closes[i - 1])
+                falling_closes = sum(1 for i in range(1, len(d_closes))
+                                     if d_closes[i] < d_closes[i - 1])
+
+                # Daily HH/LL
+                if len(d_highs) >= 3:
+                    d_hh = d_highs[-1] > d_highs[-2] and d_lows[-1] > d_lows[-2]
+                    d_ll = d_lows[-1] < d_lows[-2] and d_highs[-1] < d_highs[-2]
                 else:
-                    bull += 0.15; bear += 0.15; comp["ms"] = "MIXED"
+                    d_hh, d_ll = False, False
 
-            # 3. Higher highs / lower lows (20%)
-            recent_highs = [float(c['h']) for c in c4h[-10:]]
-            recent_lows  = [float(c['l']) for c in c4h[-10:]]
-            if len(recent_highs) >= 4:
-                hh = recent_highs[-1] > recent_highs[-3]
-                hl = recent_lows[-1] > recent_lows[-3]
-                ll = recent_lows[-1] < recent_lows[-3]
-                lh = recent_highs[-1] < recent_highs[-3]
-                if hh and hl:
-                    bull += 0.20; comp["swing"] = "HH_HL"
-                elif ll and lh:
-                    bear += 0.20; comp["swing"] = "LL_LH"
+                if rising_closes >= 2 or d_hh:
+                    bull += 0.15; comp["daily"] = f"BULL({rising_closes}↑)"
+                elif falling_closes >= 2 or d_ll:
+                    bear += 0.15; comp["daily"] = f"BEAR({falling_closes}↓)"
                 else:
-                    bull += 0.10; bear += 0.10; comp["swing"] = "MIXED"
+                    bull += 0.075; bear += 0.075; comp["daily"] = "MIXED"
+            else:
+                bull += 0.075; bear += 0.075; comp["daily"] = "N/A"
 
-            # 4. Recent BOS (20%)
-            recent_bos = [ms for ms in self.market_structures
-                          if ms.structure_type == "BOS"
-                          and ms.timeframe in ("4h", "1h")][-3:]
-            if recent_bos:
-                last = recent_bos[-1]
-                if last.direction == "bullish":
-                    bull += 0.20; comp["bos"] = "BULL"
+            # ── 5. PRICE vs KEY 4H LEVELS (10%) ──────────────────────────
+            if htf_highs and htf_lows:
+                last_4h_high = htf_highs[-1].price
+                last_4h_low = htf_lows[-1].price
+                swing_range = last_4h_high - last_4h_low if last_4h_high > last_4h_low else 1.0
+
+                # Where is price in the last 4H swing range?
+                if current_price > last_4h_high:
+                    bull += 0.10; comp["level"] = "ABOVE_4H_HIGH"
+                elif current_price < last_4h_low:
+                    bear += 0.10; comp["level"] = "BELOW_4H_LOW"
                 else:
-                    bear += 0.20; comp["bos"] = "BEAR"
+                    position = (current_price - last_4h_low) / swing_range
+                    if position > 0.65:
+                        bull += 0.07; bear += 0.03; comp["level"] = f"HIGH({position:.0%})"
+                    elif position < 0.35:
+                        bear += 0.07; bull += 0.03; comp["level"] = f"LOW({position:.0%})"
+                    else:
+                        bull += 0.05; bear += 0.05; comp["level"] = f"MID({position:.0%})"
+            else:
+                bull += 0.05; bear += 0.05; comp["level"] = "N/A"
 
+            # ── FINAL CALCULATION ──────────────────────────────────────────
             total = bull + bear or 1.0
-            bull_pct, bear_pct = bull / total, bear / total
+            bull_pct = bull / total
+            bear_pct = bear / total
 
-            THRESH = 0.60
-            if bull_pct >= THRESH and ema_dist >= min_dist:
+            # Threshold: 55% for direction (was 60% which was too strict)
+            # With 5 properly weighted components, 55% represents genuine consensus
+            THRESH = config.HTF_BIAS_THRESHOLD  # 0.55
+
+            if bull_pct >= THRESH:
                 self.htf_bias          = "BULLISH"
                 self.htf_bias_strength = round(bull_pct, 3)
-            elif bear_pct >= THRESH and ema_dist >= min_dist:
+            elif bear_pct >= THRESH:
                 self.htf_bias          = "BEARISH"
                 self.htf_bias_strength = round(bear_pct, 3)
             else:
@@ -1492,18 +1653,112 @@ class AdvancedICTStrategy:
             logger.error(f"❌ HTF bias error: {e}", exc_info=True)
 
     def _update_daily_bias(self, candles_5m: List[Dict], current_price: float) -> None:
+        """
+        Industry-grade daily/session bias using 1H structure + price context.
+
+        Components:
+          1. 1H Market Structure direction (dominant)
+          2. 1H swing sequence (HH/HL or LL/LH on confirmed 1H swings)
+          3. Session open direction (where has price gone since last session open)
+
+        NOT using 5m EMA crossover — that's micro-noise, not session bias.
+        """
         try:
-            if len(candles_5m) < 20:
-                return
-            closes = [float(c['c']) for c in candles_5m[-20:]]
-            ema_fast = self._calculate_ema(closes, 8)
-            ema_slow = self._calculate_ema(closes, 21)
-            if ema_fast > ema_slow:
+            bull_score, bear_score = 0.0, 0.0
+
+            # ── 1. 1H Market Structure (50%) ──────────────────────────────
+            mss_1h = [ms for ms in self.market_structures
+                      if ms.timeframe == "1h" and ms.confirmed]
+            recent_1h = mss_1h[-5:] if mss_1h else []
+
+            if recent_1h:
+                w_bull, w_bear, w_total = 0.0, 0.0, 0.0
+                for idx, ms in enumerate(recent_1h):
+                    weight = 1.0 + idx * 0.5
+                    if ms.structure_type == "CHoCH":
+                        weight *= 1.4
+                    w_total += weight
+                    if ms.direction == "bullish":
+                        w_bull += weight
+                    else:
+                        w_bear += weight
+                if w_total > 0:
+                    bull_score += 0.50 * (w_bull / w_total)
+                    bear_score += 0.50 * (w_bear / w_total)
+            else:
+                # Fallback to 15m structure if no 1H available
+                mss_15m = [ms for ms in self.market_structures
+                           if ms.timeframe == "15m" and ms.confirmed]
+                recent_15m = mss_15m[-5:] if mss_15m else []
+                if recent_15m:
+                    b_count = sum(1 for m in recent_15m if m.direction == "bullish")
+                    s_count = len(recent_15m) - b_count
+                    if b_count > s_count:
+                        bull_score += 0.50 * (b_count / len(recent_15m))
+                        bear_score += 0.50 * (s_count / len(recent_15m))
+                    else:
+                        bear_score += 0.50 * (s_count / len(recent_15m))
+                        bull_score += 0.50 * (b_count / len(recent_15m))
+                else:
+                    bull_score += 0.25; bear_score += 0.25
+
+            # ── 2. 1H Swing Sequence (30%) ────────────────────────────────
+            h1_highs = sorted(
+                [s for s in self.swing_highs if s.timeframe == "1h" and s.confirmed],
+                key=lambda s: s.timestamp)
+            h1_lows = sorted(
+                [s for s in self.swing_lows if s.timeframe == "1h" and s.confirmed],
+                key=lambda s: s.timestamp)
+
+            swing_b, swing_s = 0, 0
+            if len(h1_highs) >= 2:
+                for i in range(-1, max(-len(h1_highs), -4), -1):
+                    if i - 1 >= -len(h1_highs):
+                        if h1_highs[i].price > h1_highs[i - 1].price:
+                            swing_b += 1
+                        elif h1_highs[i].price < h1_highs[i - 1].price:
+                            swing_s += 1
+            if len(h1_lows) >= 2:
+                for i in range(-1, max(-len(h1_lows), -4), -1):
+                    if i - 1 >= -len(h1_lows):
+                        if h1_lows[i].price > h1_lows[i - 1].price:
+                            swing_b += 1
+                        elif h1_lows[i].price < h1_lows[i - 1].price:
+                            swing_s += 1
+
+            sw_total = swing_b + swing_s
+            if sw_total > 0:
+                bull_score += 0.30 * (swing_b / sw_total)
+                bear_score += 0.30 * (swing_s / sw_total)
+            else:
+                bull_score += 0.15; bear_score += 0.15
+
+            # ── 3. Session Price Direction (20%) ──────────────────────────
+            # Use recent 5m candles to determine intraday direction
+            if len(candles_5m) >= 12:
+                # Compare current price vs price ~1 hour ago (12 × 5m candles)
+                session_open = float(candles_5m[-12]['o'])
+                if current_price > session_open * 1.001:
+                    bull_score += 0.20
+                elif current_price < session_open * 0.999:
+                    bear_score += 0.20
+                else:
+                    bull_score += 0.10; bear_score += 0.10
+            else:
+                bull_score += 0.10; bear_score += 0.10
+
+            # ── FINAL ──────────────────────────────────────────────────────
+            total = bull_score + bear_score or 1.0
+            b_pct = bull_score / total
+            s_pct = bear_score / total
+
+            if b_pct >= 0.58:
                 self.daily_bias = "BULLISH"
-            elif ema_fast < ema_slow:
+            elif s_pct >= 0.58:
                 self.daily_bias = "BEARISH"
             else:
                 self.daily_bias = "NEUTRAL"
+
         except Exception as e:
             logger.error(f"❌ Daily bias error: {e}", exc_info=True)
 

@@ -258,7 +258,7 @@ ENTRY_PENDING_TIMEOUT_SECONDS      = 120
 # ─────────────────────────────────────────────
 LOG_LEVEL                    = "INFO"
 TELEGRAM_REPORT_INTERVAL_SEC = 900.0
-OUTLOOK_INTERVAL_SECONDS     = 900        # 5 min — thinking/outlook to Telegram
+OUTLOOK_INTERVAL_SECONDS     = 900        # 15 min — single consolidated Telegram report
 
 # ─────────────────────────────────────────────
 # FEES

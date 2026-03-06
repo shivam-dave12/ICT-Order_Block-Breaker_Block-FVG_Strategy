@@ -200,7 +200,9 @@ class ICTBot:
                     self.risk_manager,
                     int(time.time() * 1000))
 
-                self.maybe_send_telegram_report()
+                # NOTE: Telegram reports are now sent by strategy._log_market_outlook()
+                # as a single consolidated message (outlook + stats + position).
+                # No separate periodic report needed.
 
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt")

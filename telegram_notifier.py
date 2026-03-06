@@ -333,10 +333,28 @@ def format_market_outlook(
     short_plan: Optional[Dict] = None,
     # Entry eval status
     entry_eval_status: str = "",
+    # ── Consolidated stats (merged from periodic report) ──
+    balance: float = 0.0,
+    total_trades: int = 0,
+    win_rate: float = 0.0,
+    daily_pnl: float = 0.0,
+    total_pnl: float = 0.0,
+    consecutive_losses: int = 0,
+    bot_state: str = "READY",
+    position: Optional[Dict] = None,
+    current_sl: Optional[float] = None,
+    current_tp: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    breakeven_moved: bool = False,
+    profit_locked_pct: float = 0.0,
+    regime_atr_ratio: float = 0.0,
+    regime_size_mult: float = 0.0,
+    volume_delta: Optional[Dict] = None,
 ) -> str:
     """
-    The 'thinking' report — shows everything the bot sees and plans to do.
-    Sent every 5 minutes so you can verify structures on chart.
+    CONSOLIDATED report — market outlook + bot stats + position.
+    Single comprehensive Telegram message replacing both the old
+    'market outlook' and 'periodic report' to avoid double notifications.
     """
     bullish_obs = bullish_obs or []
     bearish_obs = bearish_obs or []
@@ -513,6 +531,54 @@ def format_market_outlook(
 
     if entry_eval_status:
         lines.append(f"\n  💡 {entry_eval_status}")
+
+    # ── CONSOLIDATED: Bot Stats + Position (merged from periodic report) ──
+    lines.append("")
+    pnl_icon = "🟢" if daily_pnl >= 0 else "🔴"
+    lines.append(f"<b>💰 ACCOUNT</b>")
+    lines.append(f"  Balance: {_fmt_price(balance)} | State: <b>{bot_state}</b>")
+    lines.append(f"  {pnl_icon} Daily P&amp;L: {_fmt_price(daily_pnl)} | Total: {_fmt_price(total_pnl)}")
+    lines.append(f"  Trades: {total_trades} | WR: {win_rate:.1f}% | Losses: {consecutive_losses}")
+    if regime_atr_ratio > 0:
+        lines.append(f"  ATR×: {regime_atr_ratio:.2f} | Size×: {regime_size_mult:.2f}")
+
+    # Active position
+    if position:
+        p_side = position.get("side", "?").upper()
+        p_entry = entry_price or position.get("entry_price", 0)
+        lines.append("")
+        lines.append(f"<b>🔹 POSITION: {p_side}</b>")
+        lines.append(f"  Entry: {_fmt_price(p_entry)}")
+        if current_sl:
+            lines.append(f"  SL: {_fmt_price(current_sl)}")
+        if current_tp:
+            lines.append(f"  TP: {_fmt_price(current_tp)}")
+        if breakeven_moved:
+            lines.append(f"  🔒 BE moved | Locked: {profit_locked_pct:.1f}R")
+        if p_entry and current_price:
+            qty = float(position.get("quantity", 0) or position.get("qty", 0) or 0)
+            if p_side == "LONG":
+                price_delta = current_price - p_entry
+            else:
+                price_delta = p_entry - current_price
+            try:
+                import config as _cfg
+                _leverage = getattr(_cfg, "LEVERAGE", 1)
+            except Exception:
+                _leverage = 1
+            usdt_pnl = price_delta * qty * _leverage if qty > 0 else price_delta
+            risk_price = abs(p_entry - current_sl) if current_sl else 0
+            ur_r = price_delta / risk_price if risk_price > 0 else 0
+            upnl_icon = "🟢" if price_delta >= 0 else "🔴"
+            if qty > 0:
+                lines.append(f"  {upnl_icon} uPnL: <b>${usdt_pnl:+.2f}</b> ({ur_r:+.1f}R)")
+            else:
+                lines.append(f"  {upnl_icon} uPnL: Δ{_fmt_price(abs(price_delta))} ({ur_r:+.1f}R)")
+
+    if volume_delta and isinstance(volume_delta, dict):
+        dp = volume_delta.get("delta_pct", 0.0)
+        if dp != 0:
+            lines.append(f"  Vol Δ: {dp:+.2%}")
 
     return "\n".join(lines)
 
