@@ -451,6 +451,13 @@ class AdvancedICTStrategy:
         self._tp_guardian_stop:   threading.Event = threading.Event()
         self._tp_guardian_thread: Optional[threading.Thread] = None
 
+        # ── Range-Bound Trading Mode ─────────────────────────────────────
+        # Activates when HTF NEUTRAL + low ADX + valid DR → mean-reversion
+        # Long at DR discount, short at DR premium, using same ICT structures.
+        self._range_bound_active:  bool = False
+        self._range_bound_daily_trades: int  = 0
+        self._range_bound_trade_day:    int  = 0   # day-of-year for reset
+
         logger.info("✅ AdvancedICTStrategy v11 created (single TP/SL, structure trailing, sniper entry)")
 
     # ==================================================================
@@ -849,6 +856,16 @@ class AdvancedICTStrategy:
                             f"(BOS @ ${self._displacement_bos_price:,.0f}) → "
                             f"expecting retracement {retrace_dir} into FVGs")
 
+            # Range-bound mode status
+            if self._is_range_bound_mode():
+                dr = self._get_range_bound_dr()
+                if dr:
+                    zone = dr.zone_pct(current_price)
+                    logger.info(f"   📊 RANGE-BOUND MODE ACTIVE — DR ${dr.low:,.1f}–${dr.high:,.1f} "
+                                f"(zone {zone*100:.0f}%) | "
+                                f"Trades today: {self._range_bound_daily_trades}/"
+                                f"{getattr(config, 'RANGE_BOUND_MAX_DAILY_TRADES', 4)}")
+
             # ── Build trade plans for both sides ────────────────
             long_plan = self._build_trade_plan("long", current_price, data_manager, now_ms)
             short_plan = self._build_trade_plan("short", current_price, data_manager, now_ms)
@@ -1058,7 +1075,13 @@ class AdvancedICTStrategy:
             if "tp_reason" not in plan:
                 plan["tp_reason"] = "opposing structure"
 
-            if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
+            # Range-bound mode uses different RR minimum
+            if self._range_bound_active:
+                rb_min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
+                plan["range_bound"] = True
+                if rr < rb_min_rr - 1e-9:
+                    plan["gate_failed"] = f"RR {rr:.1f}x (min {rb_min_rr}x range-bound)"
+            elif rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
                 plan["gate_failed"] = f"RR {rr:.1f}x (min {config.MIN_RISK_REWARD_RATIO}x)"
 
             return plan
@@ -1071,8 +1094,9 @@ class AdvancedICTStrategy:
     def _log_trade_plan(self, label: str, plan: Dict, price: float) -> None:
         """Log a trade plan to console."""
         status = plan.get("status", "?")
+        rb_tag = " [RANGE]" if plan.get("range_bound") else ""
         if status == "READY":
-            logger.info(f"   🎯 {label}: READY @ ${plan.get('entry', 0):,.1f} "
+            logger.info(f"   🎯 {label}: READY{rb_tag} @ ${plan.get('entry', 0):,.1f} "
                         f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
                         f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
         elif "BLOCKED" in status or "BELOW" in status:
@@ -2255,6 +2279,314 @@ class AdvancedICTStrategy:
         return True
 
     # ==================================================================
+    # RANGE-BOUND TRADING MODE
+    # ==================================================================
+    # Activates when HTF is NEUTRAL and market is ranging (low ADX).
+    # Uses the SAME ICT structures (OB, FVG, sweeps, MSS) but trades
+    # mean-reversion within the dealing range instead of waiting for
+    # directional bias.  Long at DR discount, short at DR premium.
+    #
+    # This is an ADDITIVE path — all existing directional logic is
+    # completely unchanged.  Range-bound mode is checked BEFORE the
+    # HTF NEUTRAL block in _cascade_l1; if it doesn't qualify, the
+    # normal NEUTRAL rejection fires as before.
+    # ==================================================================
+
+    def _is_range_bound_mode(self) -> bool:
+        """
+        Determine if the market qualifies for range-bound trading.
+
+        Requirements (ALL must be true):
+          1. config.RANGE_BOUND_ENABLED is True
+          2. HTF bias is NEUTRAL (if directional, use normal path)
+          3. Regime ADX < RANGE_BOUND_MAX_ADX (confirms low momentum)
+          4. A valid dealing range exists (intraday or daily) with size
+             between MIN and MAX DR size thresholds
+          5. Enough candle data available (MIN_CANDLES_5M)
+
+        Returns True only when ALL conditions are met.
+        """
+        if not getattr(config, "RANGE_BOUND_ENABLED", False):
+            return False
+
+        # Must be HTF NEUTRAL — if directional, normal path handles it
+        if self.htf_bias != "NEUTRAL":
+            return False
+
+        # ADX must confirm ranging / low-momentum conditions
+        rs = self.regime_engine.state
+        max_adx = getattr(config, "RANGE_BOUND_MAX_ADX", 22.0)
+        if rs.adx > max_adx:
+            return False
+
+        # Need a valid dealing range to define the boundaries
+        dr = self._get_range_bound_dr()
+        if dr is None:
+            return False
+
+        # Must have enough data
+        min_candles = getattr(config, "RANGE_BOUND_MIN_CANDLES_5M", 60)
+        if self._data_manager:
+            c5m = self._data_manager.get_candles("5m") or []
+            if len(c5m) < min_candles:
+                return False
+
+        return True
+
+    def _get_range_bound_dr(self):
+        """
+        Return the best dealing range for range-bound trading, or None.
+
+        Prefers intraday DR, then daily, then weekly.
+        The DR must have size within [MIN_DR_SIZE_PCT, MAX_DR_SIZE_PCT] of price.
+        """
+        candidates = []
+        # Prefer intraday first (tightest, most actionable), then daily
+        for dr in [self._ndr.intraday, self._ndr.daily, self._ndr.weekly]:
+            if dr is None:
+                continue
+            mid = dr.midpoint
+            if mid <= 0:
+                continue
+            size_pct = dr.size / mid * 100
+            min_pct = getattr(config, "RANGE_BOUND_MIN_DR_SIZE_PCT", 0.30)
+            max_pct = getattr(config, "RANGE_BOUND_MAX_DR_SIZE_PCT", 3.00)
+            if min_pct <= size_pct <= max_pct:
+                candidates.append((dr, size_pct))
+
+        if not candidates:
+            return None
+
+        # Return first valid (intraday > daily > weekly preference is preserved)
+        return candidates[0][0]
+
+    def _cascade_l1_range_bound(self, side: str, price: float,
+                                 now: int) -> Tuple[bool, str]:
+        """
+        L1 Gate for range-bound mode — replaces HTF directional requirement
+        with DR zone alignment.
+
+        ICT RANGING principles:
+          - Long ONLY in discount zone (below RANGE_BOUND_DISCOUNT_ENTRY)
+          - Short ONLY in premium zone (above RANGE_BOUND_PREMIUM_ENTRY)
+          - Still respect weekly DR extremes (don't buy at weekly premium)
+          - Still respect post-CHoCH blocks
+          - Still respect regime gates (but relaxed for ranging context)
+
+        This gate is ONLY called when _is_range_bound_mode() returns True,
+        meaning HTF is NEUTRAL and ADX confirms ranging conditions.
+        """
+        # ── Post-CHoCH directional block (unchanged — same safety gate) ────
+        if self._choch_invalidated_side == side:
+            if now < self._choch_block_expires_ms:
+                remaining_min = (self._choch_block_expires_ms - now) / 60_000
+                return False, (
+                    f"[RANGE] Post-CHoCH {side.upper()} block active — "
+                    f"{remaining_min:.0f}m remaining"
+                )
+            required_dir = "bullish" if side == "long" else "bearish"
+            has_fresh_mss = any(
+                ms.direction == required_dir
+                and ms.timestamp > self._choch_ts
+                for ms in list(self.market_structures)[-20:]
+            )
+            if has_fresh_mss:
+                self._choch_invalidated_side = None
+            else:
+                return False, (
+                    f"[RANGE] Post-CHoCH {side.upper()} — no fresh "
+                    f"{required_dir.upper()} MSS yet"
+                )
+
+        # ── Weekly DR extreme safety (unchanged) ──────────────────────────
+        if self._ndr.weekly is not None:
+            wz = self._ndr.weekly.zone_pct(price)
+            if side == "long" and wz > 0.85:
+                return False, f"[RANGE] Weekly extreme premium ({wz:.0%}) blocks long"
+            if side == "short" and wz < 0.15:
+                return False, f"[RANGE] Weekly extreme discount ({wz:.0%}) blocks short"
+
+        # ── DR zone alignment (the core range-bound rule) ────────────────
+        dr = self._get_range_bound_dr()
+        if dr is None:
+            return False, "[RANGE] No valid DR for range-bound entry"
+
+        zone = dr.zone_pct(price)
+        discount_thresh = getattr(config, "RANGE_BOUND_DISCOUNT_ENTRY", 0.25)
+        premium_thresh  = getattr(config, "RANGE_BOUND_PREMIUM_ENTRY", 0.75)
+
+        if side == "long":
+            if zone > discount_thresh:
+                return False, (
+                    f"[RANGE] Long requires discount (zone {zone:.0%} "
+                    f"> {discount_thresh:.0%} threshold) — price too high in DR"
+                )
+        elif side == "short":
+            if zone < premium_thresh:
+                return False, (
+                    f"[RANGE] Short requires premium (zone {zone:.0%} "
+                    f"< {premium_thresh:.0%} threshold) — price too low in DR"
+                )
+
+        # ── Daily trade limit for range-bound mode ───────────────────────
+        today_doy = datetime.fromtimestamp(now / 1000, tz=timezone.utc).timetuple().tm_yday
+        if self._range_bound_trade_day != today_doy:
+            self._range_bound_trade_day = today_doy
+            self._range_bound_daily_trades = 0
+
+        max_rb_trades = getattr(config, "RANGE_BOUND_MAX_DAILY_TRADES", 4)
+        if self._range_bound_daily_trades >= max_rb_trades:
+            return False, f"[RANGE] Daily range-bound trade limit reached ({max_rb_trades})"
+
+        return True, "L1_OK (range-bound mode)"
+
+    def _get_range_bound_entry_threshold(self) -> float:
+        """Return the entry threshold for range-bound trades."""
+        if self.current_session == "WEEKEND":
+            return getattr(config, "RANGE_BOUND_THRESHOLD_WEEKEND", 80)
+        return getattr(config, "RANGE_BOUND_ENTRY_THRESHOLD", 72)
+
+    def _calculate_range_bound_tp(self, side: str, entry_price: float,
+                                   risk: float, current_time: int,
+                                   ctx, quiet: bool = False):
+        """
+        Calculate TP for range-bound trades.
+
+        Priority:
+          1. Structural target within the range (opposing OB/FVG/liq pool)
+          2. DR equilibrium (midpoint) — the natural mean-reversion target
+          3. None if no valid target meets minimum RR
+
+        Range-bound trades target the MIDDLE of the range, not the far side.
+        Taking profit at equilibrium is conservative but consistent with
+        ICT ranging model (price oscillates around EQ).
+        """
+        from structure_engine import _atr as compute_atr
+
+        dr = self._get_range_bound_dr()
+        if dr is None:
+            return None
+
+        tick = config.TICK_SIZE
+        c5m_data = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
+        atr = compute_atr(c5m_data, config.SL_ATR_PERIOD) if len(c5m_data) >= config.SL_ATR_PERIOD + 1 else entry_price * 0.002
+        buffer = atr * config.SL_ATR_BUFFER_MULT
+
+        min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
+        max_rr = getattr(config, "RANGE_BOUND_MAX_RR", 6.0)
+        prefer_structure = getattr(config, "RANGE_BOUND_TP_PREFER_STRUCTURE", True)
+
+        tp_price = None
+
+        if prefer_structure:
+            if side == "long":
+                # 1A. Opposing liquidity (EQH within range)
+                eqh_pools = [lp for lp in self.liquidity_pools
+                             if lp.pool_type == "EQH" and not lp.swept
+                             and lp.price > entry_price
+                             and lp.price <= dr.high]
+                if eqh_pools:
+                    nearest = min(eqh_pools, key=lambda p: p.price)
+                    rr = (nearest.price - entry_price) / risk if risk > 0 else 0
+                    if min_rr <= rr <= max_rr:
+                        tp_price = nearest.price - buffer
+
+                # 1B. Opposing bearish OB within range
+                if tp_price is None:
+                    opposing_obs = [ob for ob in self.order_blocks_bear
+                                    if ob.is_active(current_time)
+                                    and ob.low > entry_price
+                                    and ob.low <= dr.high]
+                    if opposing_obs:
+                        nearest_ob = min(opposing_obs, key=lambda o: o.low)
+                        rr = (nearest_ob.low - entry_price) / risk if risk > 0 else 0
+                        if min_rr <= rr <= max_rr:
+                            tp_price = nearest_ob.low - buffer
+
+                # 1C. Bearish FVG within range (resistance zone)
+                if tp_price is None:
+                    opposing_fvgs = [f for f in self.fvgs_bear
+                                     if f.is_active(current_time)
+                                     and f.bottom > entry_price
+                                     and f.bottom <= dr.high
+                                     and f.fill_percentage < 0.8]
+                    if opposing_fvgs:
+                        nearest_fvg = min(opposing_fvgs, key=lambda f: f.bottom)
+                        rr = (nearest_fvg.bottom - entry_price) / risk if risk > 0 else 0
+                        if min_rr <= rr <= max_rr:
+                            tp_price = nearest_fvg.bottom - buffer
+
+            else:  # short
+                # 1A. Opposing liquidity (EQL within range)
+                eql_pools = [lp for lp in self.liquidity_pools
+                             if lp.pool_type == "EQL" and not lp.swept
+                             and lp.price < entry_price
+                             and lp.price >= dr.low]
+                if eql_pools:
+                    nearest = max(eql_pools, key=lambda p: p.price)
+                    rr = (entry_price - nearest.price) / risk if risk > 0 else 0
+                    if min_rr <= rr <= max_rr:
+                        tp_price = nearest.price + buffer
+
+                # 1B. Opposing bullish OB within range
+                if tp_price is None:
+                    opposing_obs = [ob for ob in self.order_blocks_bull
+                                    if ob.is_active(current_time)
+                                    and ob.high < entry_price
+                                    and ob.high >= dr.low]
+                    if opposing_obs:
+                        nearest_ob = max(opposing_obs, key=lambda o: o.high)
+                        rr = (entry_price - nearest_ob.high) / risk if risk > 0 else 0
+                        if min_rr <= rr <= max_rr:
+                            tp_price = nearest_ob.high + buffer
+
+                # 1C. Bullish FVG within range (support zone)
+                if tp_price is None:
+                    opposing_fvgs = [f for f in self.fvgs_bull
+                                     if f.is_active(current_time)
+                                     and f.top < entry_price
+                                     and f.top >= dr.low
+                                     and f.fill_percentage < 0.8]
+                    if opposing_fvgs:
+                        nearest_fvg = max(opposing_fvgs, key=lambda f: f.top)
+                        rr = (entry_price - nearest_fvg.top) / risk if risk > 0 else 0
+                        if min_rr <= rr <= max_rr:
+                            tp_price = nearest_fvg.top + buffer
+
+        # 2. Fallback: DR equilibrium (midpoint)
+        if tp_price is None:
+            eq_buffer_pct = getattr(config, "RANGE_BOUND_TP_EQ_BUFFER_PCT", 0.001)
+            eq = dr.midpoint
+            if side == "long":
+                target = eq - eq * eq_buffer_pct
+                rr = (target - entry_price) / risk if risk > 0 else 0
+                if rr >= min_rr:
+                    tp_price = target
+            else:
+                target = eq + eq * eq_buffer_pct
+                rr = (entry_price - target) / risk if risk > 0 else 0
+                if rr >= min_rr:
+                    tp_price = target
+
+        # 3. Last resort: DR opposing boundary (75% of range, not full)
+        if tp_price is None:
+            if side == "long":
+                target = dr.low + dr.size * 0.70 - buffer
+                rr = (target - entry_price) / risk if risk > 0 else 0
+                if rr >= min_rr:
+                    tp_price = target
+            else:
+                target = dr.high - dr.size * 0.70 + buffer
+                rr = (entry_price - target) / risk if risk > 0 else 0
+                if rr >= min_rr:
+                    tp_price = target
+
+        if tp_price is not None:
+            tp_price = round(tp_price / tick) * tick
+
+        return tp_price
+
+    # ==================================================================
     # CASCADE L1: Hard gates
     # ==================================================================
 
@@ -2318,7 +2650,18 @@ class AdvancedICTStrategy:
                     return False, f"Retracement short blocked — weekly extreme discount ({wz:.0%})"
             return True, "L1_OK (retracement after displacement)"
 
+        # ── RANGE-BOUND MODE BYPASS ────────────────────────────────────────
+        # When HTF is NEUTRAL but market is ranging (low ADX, valid DR),
+        # allow mean-reversion trades at DR extremes instead of blocking.
+        # This check must come BEFORE the NEUTRAL rejection so it can
+        # override it.  If range-bound mode doesn't qualify, fall through
+        # to the normal NEUTRAL block below.
+        if self.htf_bias == "NEUTRAL" and self._is_range_bound_mode():
+            self._range_bound_active = True
+            return self._cascade_l1_range_bound(side, price, now)
+
         # ── HTF bias alignment ────────────────────────────────────────────
+        self._range_bound_active = False
         if self.htf_bias == "NEUTRAL":
             return False, "HTF NEUTRAL — awaiting directional bias"
         if side == "long"  and self.htf_bias == "BEARISH":
@@ -2542,6 +2885,25 @@ class AdvancedICTStrategy:
                 retrace_score = 12.0 + 8.0 * self.htf_bias_strength
                 score += retrace_score
                 reasons.append(f"RETRACE after {self._displacement_direction.upper()} disp +{retrace_score:.1f}")
+            elif self._range_bound_active:
+                # ── Range-bound: score DR zone depth instead of HTF bias ──
+                # Deeper in discount (for longs) or premium (for shorts) = more points.
+                # This replaces the HTF alignment points which are 0 in NEUTRAL.
+                dr = self._get_range_bound_dr()
+                if dr is not None:
+                    zone = dr.zone_pct(current_price)
+                    if side == "long":
+                        # Zone 0.00 = maximum discount = maximum score
+                        depth = max(0.0, 1.0 - zone / 0.382)  # 0→1 as zone goes 0.382→0
+                        rb_score = 10.0 + 15.0 * depth
+                        score += rb_score
+                        reasons.append(f"RANGE discount zone={zone*100:.0f}% depth={depth:.0%} +{rb_score:.1f}")
+                    else:
+                        # Zone 1.00 = maximum premium = maximum score
+                        depth = max(0.0, (zone - 0.618) / 0.382)  # 0→1 as zone goes 0.618→1
+                        rb_score = 10.0 + 15.0 * depth
+                        score += rb_score
+                        reasons.append(f"RANGE premium zone={zone*100:.0f}% depth={depth:.0%} +{rb_score:.1f}")
 
             # ── 2. Liquidity Sweep (0-25) ──────────────────────────────
             sweep_age_limit = config.SWEEP_MAX_AGE_MINUTES * 60_000
@@ -2697,6 +3059,10 @@ class AdvancedICTStrategy:
     # ==================================================================
 
     def _get_entry_threshold(self) -> float:
+        # ── Range-bound mode uses its own threshold ──────────────────
+        if self._range_bound_active:
+            return self._get_range_bound_entry_threshold()
+
         if self.current_session == "WEEKEND":
             base = config.ENTRY_THRESHOLD_WEEKEND
         elif self.in_killzone:
@@ -3062,6 +3428,10 @@ class AdvancedICTStrategy:
             if should_log:
                 logger.info("=" * 80)
                 logger.info(f"🎯 HIGH CONFLUENCE [{side.upper()}] Score={score:.0f}")
+                if self._range_bound_active:
+                    dr = self._get_range_bound_dr()
+                    zone_pct = dr.zone_pct(current_price) * 100 if dr else 0
+                    logger.info(f"   📊 RANGE-BOUND MODE — mean-reversion at DR zone {zone_pct:.0f}%")
                 if self._is_retracement_trade(side):
                     logger.info(f"   📐 RETRACEMENT TRADE after {self._displacement_direction.upper()} displacement")
                 for r in reasons:
@@ -3093,9 +3463,36 @@ class AdvancedICTStrategy:
             reward = abs(tp_price - entry_price)
             rr     = reward / risk if risk > 0 else 0
 
-            if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
-                logger.warning(f"⚠️ RR={rr:.4f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
-                return
+            # ── Range-bound mode: override TP if structural TP is outside range ──
+            # Also use range-specific RR minimum (lower than directional trades)
+            is_range_trade = self._range_bound_active
+            if is_range_trade:
+                rb_min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
+                rb_max_rr = getattr(config, "RANGE_BOUND_MAX_RR", 6.0)
+
+                # If TP is unreasonably far for a range trade (beyond DR boundary),
+                # recalculate using range-bound TP targeting
+                dr = self._get_range_bound_dr()
+                if dr is not None:
+                    tp_beyond_range = (
+                        (side == "long" and tp_price > dr.high) or
+                        (side == "short" and tp_price < dr.low)
+                    )
+                    if tp_beyond_range or rr > rb_max_rr:
+                        rb_tp = self._calculate_range_bound_tp(
+                            side, entry_price, risk, current_time, ctx, quiet=True)
+                        if rb_tp is not None:
+                            tp_price = rb_tp
+                            reward = abs(tp_price - entry_price)
+                            rr = reward / risk if risk > 0 else 0
+
+                if rr < rb_min_rr - 1e-9:
+                    logger.warning(f"⚠️ [RANGE] RR={rr:.4f} < min {rb_min_rr} — skipping")
+                    return
+            else:
+                if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
+                    logger.warning(f"⚠️ RR={rr:.4f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
+                    return
 
             # Position size
             _, dr_mult = self._ndr.alignment_score(current_price, side)
@@ -3109,7 +3506,13 @@ class AdvancedICTStrategy:
                 return
 
             # Apply regime + DR multipliers
-            position_size = round(position_size * rs.size_multiplier * dr_mult, 4)
+            size_mult = rs.size_multiplier * dr_mult
+            # ── Range-bound: apply additional size reduction ──
+            if is_range_trade:
+                rb_size_mult = getattr(config, "RANGE_BOUND_SIZE_MULT", 0.65)
+                size_mult *= rb_size_mult
+
+            position_size = round(position_size * size_mult, 4)
             position_size = max(config.MIN_POSITION_SIZE,
                                min(position_size, config.MAX_POSITION_SIZE))
 
@@ -3172,6 +3575,15 @@ class AdvancedICTStrategy:
             risk_manager.notify_entry_placed()
 
             self.total_entries += 1
+
+            # ── Range-bound trade tracking ─────────────────────────────────
+            if is_range_trade:
+                self._range_bound_daily_trades += 1
+                logger.info(
+                    f"📊 [RANGE-BOUND TRADE #{self._range_bound_daily_trades}] "
+                    f"Mean-reversion {side.upper()} in DR "
+                    f"(zone={self._get_dr_zone_tag(current_price)})"
+                )
 
             # Store entry context for close report
             self.entry_score = score

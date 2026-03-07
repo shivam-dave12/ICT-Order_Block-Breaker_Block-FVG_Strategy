@@ -272,3 +272,38 @@ COMMISSION_RATE = 0.00055   # 0.055% taker fee
 # STRUCTURE MAINTENANCE
 # ─────────────────────────────────────────────
 STRUCTURE_CLEANUP_DISTANCE_PCT = 5.0
+
+
+# ─────────────────────────────────────────────
+# RANGE-BOUND TRADING MODE
+# ─────────────────────────────────────────────
+# Activates when HTF bias is NEUTRAL and market is ranging (low ADX).
+# Trades mean-reversion: long at DR discount, short at DR premium.
+# Uses the same ICT/SMC structure (OB, FVG, sweeps) — NOT random S/R.
+# All directional (trending) logic remains completely unchanged.
+
+RANGE_BOUND_ENABLED          = True      # master switch
+RANGE_BOUND_MAX_ADX          = 22.0      # ADX must be below this threshold
+RANGE_BOUND_MIN_DR_SIZE_PCT  = 0.30      # DR must span >= 0.30% of price
+RANGE_BOUND_MAX_DR_SIZE_PCT  = 3.00      # DR wider than 3% is likely trending, not ranging
+
+# ── Zone thresholds within the DR ──
+RANGE_BOUND_DISCOUNT_ENTRY   = 0.25      # longs allowed below 25% of DR (deep discount)
+RANGE_BOUND_PREMIUM_ENTRY    = 0.75      # shorts allowed above 75% of DR (deep premium)
+
+# ── Position sizing & risk ──
+RANGE_BOUND_SIZE_MULT        = 0.65      # 65% of normal position size (mean-reversion is riskier)
+RANGE_BOUND_MIN_RR           = 1.8       # lower RR acceptable (range TP is closer)
+RANGE_BOUND_MAX_RR           = 6.0       # cap RR — in range, extreme extensions are unlikely
+
+# ── Entry confluence ──
+RANGE_BOUND_ENTRY_THRESHOLD  = 72        # confluence score needed (higher than killzone, lower than weekend)
+RANGE_BOUND_THRESHOLD_WEEKEND = 80       # even stricter on weekends
+
+# ── TP targeting ──
+RANGE_BOUND_TP_EQ_BUFFER_PCT = 0.001     # TP buffer inside DR EQ (don't aim for exact EQ)
+RANGE_BOUND_TP_PREFER_STRUCTURE = True   # prefer OB/FVG/liq targets over raw DR midpoint
+
+# ── Cooldown & limits ──
+RANGE_BOUND_MAX_DAILY_TRADES = 4         # separate cap (range trades tend to cluster)
+RANGE_BOUND_MIN_CANDLES_5M   = 60        # need enough data to confirm range
