@@ -124,6 +124,7 @@ class TelegramBotController:
     def set_my_commands(self):
         try:
             url = f"https://api.telegram.org/bot{self.bot_token}/setMyCommands"
+
             commands = [
                 {"command": "start", "description": "Start trading bot"},
                 {"command": "stop", "description": "Stop trading bot"},
@@ -139,7 +140,20 @@ class TelegramBotController:
                 {"command": "set", "description": "Set config value"},
                 {"command": "help", "description": "Show commands"},
             ]
-            requests.post(url, json={"commands": commands}, timeout=10)
+
+            payload = {
+                "commands": commands,
+                "scope": {"type": "all_private_chats"},
+                "language_code": "en"
+            }
+
+            resp = requests.post(url, json=payload, timeout=10)
+
+            if resp.status_code != 200:
+                logger.error(f"Command registration failed: {resp.text}")
+            else:
+                logger.info("Telegram commands registered successfully")
+
         except Exception as e:
             logger.error(f"Error setting commands: {e}")
 
