@@ -67,10 +67,8 @@ class FuturesAPI:
         
         # CRITICAL FIX: For GET requests, always use empty object {}
         # For POST/DELETE, use actual payload
-        if method == "GET":
-            payload_json = "{}"
-        else:
-            payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
+        # CoinSwitch always signs with empty payload {} regardless of method
+        payload_json = "{}"
         
         # Build signature message
         signature_msg = method + unquoted_endpoint + payload_json
