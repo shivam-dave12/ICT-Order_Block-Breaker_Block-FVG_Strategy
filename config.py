@@ -53,14 +53,14 @@ MAX_DRAWDOWN_PCT        = 15.0      # % max drawdown
 MAX_CONSECUTIVE_LOSSES  = 3         # halt after N consecutive losses
 MAX_DAILY_TRADES        = 8         # max trades per day
 ONE_POSITION_AT_A_TIME  = True
-MIN_TIME_BETWEEN_TRADES = 5         # minutes
-TRADE_COOLDOWN_SECONDS  = 300       # seconds cooldown after loss
+MIN_TIME_BETWEEN_TRADES = 10        # minutes
+TRADE_COOLDOWN_SECONDS  = 600       # seconds cooldown after loss
 
 
 # ─────────────────────────────────────────────
 # RISK / REWARD
 # ─────────────────────────────────────────────
-MIN_RISK_REWARD_RATIO    = 2.0
+MIN_RISK_REWARD_RATIO    = 2.5
 TARGET_RISK_REWARD_RATIO = 4.0
 MAX_RR_RATIO             = 12.0
 
@@ -68,9 +68,9 @@ MAX_RR_RATIO             = 12.0
 # ─────────────────────────────────────────────
 # ENTRY THRESHOLD (confluence score / 100)
 # ─────────────────────────────────────────────
-ENTRY_THRESHOLD_KILLZONE = 68
-ENTRY_THRESHOLD_REGULAR  = 75
-ENTRY_THRESHOLD_WEEKEND  = 82
+ENTRY_THRESHOLD_KILLZONE = 75
+ENTRY_THRESHOLD_REGULAR  = 80
+ENTRY_THRESHOLD_WEEKEND  = 88
 
 
 # ─────────────────────────────────────────────
@@ -102,15 +102,15 @@ HTF_TIMEFRAME        = "4h"
 SWING_LOOKBACK_LEFT          = 5    # bars left of pivot (3 was too noisy)
 SWING_LOOKBACK_RIGHT         = 3    # bars right confirmation
 STRUCTURE_LOOKBACK_CANDLES   = 50
-STRUCTURE_MIN_SWING_SIZE_PCT = 0.10
+STRUCTURE_MIN_SWING_SIZE_PCT = 0.15
 
 
 # ─────────────────────────────────────────────
 # ORDER BLOCKS (ICT)
 # ─────────────────────────────────────────────
-OB_MIN_IMPULSE_PCT          = 0.30   # impulse candle must move >= 0.3%
+OB_MIN_IMPULSE_PCT          = 0.50   # impulse candle must move >= 0.5%
 OB_MIN_BODY_RATIO           = 0.50   # impulse body >= 50% of range
-OB_IMPULSE_SIZE_MULTIPLIER  = 1.15   # impulse range >= 1.15x OB range
+OB_IMPULSE_SIZE_MULTIPLIER  = 1.30   # impulse range >= 1.30x OB range
 OB_MAX_AGE_MINUTES          = 1440   # 24h — OBs remain valid for a full day
 OB_WICK_REJECTION_MIN       = 0.20   # wick >= 20% of range
 OB_OPTIMAL_ENTRY_MIN        = 0.50   # OTE zone 50-79% retracement
@@ -122,7 +122,7 @@ MAX_ORDER_BLOCKS             = 20
 # ─────────────────────────────────────────────
 # FAIR VALUE GAPS (ICT)
 # ─────────────────────────────────────────────
-FVG_MIN_SIZE_PCT        = 0.015     # gap >= 0.015% of price
+FVG_MIN_SIZE_PCT        = 0.020     # gap >= 0.020% of price
 FVG_MAX_AGE_MINUTES     = 1440      # 24h — FVGs remain relevant for a full day
 FVG_FILL_INVALIDATION   = 1.0       # 100% fill = invalidated (must fully close the gap)
 MAX_FVGS                = 30
@@ -144,7 +144,7 @@ MAX_LIQUIDITY_ZONES      = 30
 # MARKET STRUCTURE (BOS / CHoCH)
 # ─────────────────────────────────────────────
 MSS_LOOKBACK_CANDLES     = 50
-MSS_MAX_AGE_MINUTES      = 60       # recent MSS window for entry
+MSS_MAX_AGE_MINUTES      = 45       # 45 min — recent MSS window for entry (enforced in L2)
 
 
 # ─────────────────────────────────────────────
@@ -180,8 +180,8 @@ PO3_ASIA_KILLZONE_END      = 2       # 02:00 UTC
 
 # ── Hard limits (used by _replace_sl_order emergency path — do not remove) ──
 SL_BUFFER_TICKS         = 5         # kept for emergency SL placement fallback
-MIN_SL_DISTANCE_PCT     = 0.002     # 0.2% — minimum SL distance from entry
-MAX_SL_DISTANCE_PCT     = 0.05      # 5%  — emergency wide-SL ceiling
+MIN_SL_DISTANCE_PCT     = 0.004     # 0.4% — minimum SL distance from entry
+MAX_SL_DISTANCE_PCT     = 0.03      # 3%  — emergency wide-SL ceiling
 SL_MIN_IMPROVEMENT_PCT  = 0.001     # kept for non-trailing SL update guards
 SL_RATCHET_ONLY         = True      # SL can only move in favour, never back
 
@@ -201,8 +201,8 @@ SL_RATCHET_ONLY         = True      # SL can only move in favour, never back
 
 SL_ATR_PERIOD               = 14    # Wilder's ATR lookback (5m candles)
 #SL_BREAKEVEN_ATR_MULT       = 0.05  # BE SL = entry ± 0.05×ATR (tiny locked profit)
-SL_ATR_BUFFER_MULT          = 0.5   # structural buffer beyond swing/OB anchor
-SL_MIN_CLEARANCE_ATR_MULT   = 1.0  # SL must stay ≥ 1×ATR from current price
+SL_ATR_BUFFER_MULT          = 0.75  # structural buffer beyond swing/OB anchor
+SL_MIN_CLEARANCE_ATR_MULT   = 1.5  # SL must stay ≥ 1.5×ATR from current price
 SL_MIN_IMPROVEMENT_ATR_MULT = 0.1   # min SL move per update (avoids exchange spam)
 TRAIL_SWING_MAX_AGE_MS      = 14_400_000   # 4 h — discard structure older than this
 #SL_BREAKEVEN_LOCK_RR      = 0.25   # fraction of initial risk to lock as profit at BE (was atr*0.05 ≈ $10)
@@ -221,8 +221,8 @@ TP_STRUCTURE_BUFFER_PCT     = 0.001   # buffer inside structure target
 # ORDER EXECUTION
 # ─────────────────────────────────────────────
 TICK_SIZE                = 0.1
-LIMIT_ORDER_OFFSET_TICKS = 8
-ORDER_TIMEOUT_SECONDS    = 600
+LIMIT_ORDER_OFFSET_TICKS = 5
+ORDER_TIMEOUT_SECONDS    = 300
 MAX_ORDER_RETRIES        = 2
 
 

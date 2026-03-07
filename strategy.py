@@ -26,6 +26,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import config
+from structure_engine import (
+    StructureEngine, TrendState,
+    SwingPoint as SESwingPoint,
+    MarketStructureShift,
+    OrderBlock as SEOrderBlock,
+    FairValueGap as SEFairValueGap,
+    LiquidityPool as SELiquidityPool,
+    _atr,
+)
 from telegram_notifier import (
     send_telegram_message, format_market_outlook,
     format_entry_alert, format_trail_update,
@@ -334,6 +343,9 @@ class AdvancedICTStrategy:
         # Volume / absorption
         self.volume_analyzer = VolumeProfileAnalyzer()
         self.absorption_model = AbsorptionModel()
+
+        # v11: Centralized structure detection
+        self.structure_engine = StructureEngine()
 
         # HTF Bias
         self.htf_bias             = "NEUTRAL"
@@ -644,7 +656,9 @@ class AdvancedICTStrategy:
 
     def _update_all_structures(self, data_manager, current_price: float,
                                 current_time: int) -> None:
+        """v11: Delegates all structure detection to StructureEngine."""
         try:
+            c1m  = data_manager.get_candles("1m")  or []
             c5m  = data_manager.get_candles("5m")  or []
             c15m = data_manager.get_candles("15m") or []
             c1h  = data_manager.get_candles("1h")  or []
@@ -659,41 +673,28 @@ class AdvancedICTStrategy:
                 self.volume_analyzer.on_candle(c5m[-1])
                 self.absorption_model.on_candle(c5m[-1])
 
-            # Swing points — ALL timeframes including HTF
-            self._detect_swing_points(c5m, current_price, "5m")
-            if len(c15m) >= 8:
-                self._detect_swing_points(c15m, current_price, "15m")
-            if len(c1h) >= 8:
-                self._detect_swing_points(c1h, current_price, "1h")
-            if len(c4h) >= 8:
-                self._detect_swing_points(c4h, current_price, "4h")
+            # Run StructureEngine update
+            candles_by_tf = {}
+            if c1m:  candles_by_tf["1m"] = c1m
+            if c5m:  candles_by_tf["5m"] = c5m
+            if c15m: candles_by_tf["15m"] = c15m
+            if c1h:  candles_by_tf["1h"] = c1h
+            if c4h:  candles_by_tf["4h"] = c4h
 
-            # Market structure — ALL timeframes including HTF
-            self._detect_market_structure(c5m, current_price, current_time, "5m")
-            if len(c15m) >= 10:
-                self._detect_market_structure(c15m, current_price, current_time, "15m")
-            if len(c1h) >= 10:
-                self._detect_market_structure(c1h, current_price, current_time, "1h")
-            if len(c4h) >= 10:
-                self._detect_market_structure(c4h, current_price, current_time, "4h")
+            self.structure_engine.update(candles_by_tf, current_price, current_time)
 
-            # Order blocks
-            self._detect_order_blocks(c5m, current_time, current_price, "5m")
-            if len(c15m) >= 5:
-                self._detect_order_blocks(c15m, current_time, current_price, "15m")
+            # Sync structure engine results to strategy's fields
+            # (so existing logging/reporting code still works)
+            self.swing_highs       = self.structure_engine.swing_highs
+            self.swing_lows        = self.structure_engine.swing_lows
+            self.market_structures = self.structure_engine.market_structures
+            self.order_blocks_bull = self.structure_engine.order_blocks_bull
+            self.order_blocks_bear = self.structure_engine.order_blocks_bear
+            self.fvgs_bull         = self.structure_engine.fvgs_bull
+            self.fvgs_bear         = self.structure_engine.fvgs_bear
+            self.liquidity_pools   = self.structure_engine.liquidity_pools
 
-            # FVGs
-            self._detect_fvgs(c5m, current_time, current_price, "5m")
-            self._update_fvg_fills(c5m)
-
-            # Liquidity
-            self._detect_liquidity_pools(current_price, current_time)
-            self._detect_liquidity_sweeps(c5m, c15m, current_price, current_time)
-
-            # Update OB visit counts
-            self._update_ob_visits(current_price, current_time)
-
-            # HTF bias (less frequent)
+            # HTF bias (keep existing logic but add conflict detection)
             self._update_htf_bias(c4h, c1d, current_price)
             self._update_daily_bias(c5m, current_price)
 
@@ -704,11 +705,8 @@ class AdvancedICTStrategy:
             if len(c4h) >= 30:
                 self.regime_engine.update(c4h)
 
-            # Displacement / retracement detection (ICT post-BOS logic)
+            # Displacement detection
             self._detect_displacement(current_price, current_time)
-
-            # Cleanup stale structures
-            self._cleanup_structures(current_price, current_time)
 
         except Exception as e:
             logger.error(f"❌ Structure update error: {e}", exc_info=True)
@@ -948,6 +946,7 @@ class AdvancedICTStrategy:
                 return plan
 
             # Score confluence
+            self._last_data_manager_ref = data_manager
             score, reasons, ctx = self._score_confluence(side, current_price, data_manager, now_ms)
             plan["score"] = score
             plan["reasons"] = reasons
@@ -2075,6 +2074,7 @@ class AdvancedICTStrategy:
                     continue
 
                 # ── SCORE: Confluence scoring ──────────────────────────────
+                self._last_data_manager_ref = data_manager
                 score, reasons, ctx = self._score_confluence(
                     side, current_price, data_manager, now_ms)
 
@@ -2156,6 +2156,20 @@ class AdvancedICTStrategy:
                                     f"— entry would be stopped by noise"
                                 )
                             continue
+
+                # ── v11: Verify price is actually in an entry zone ──
+                se = getattr(self, 'structure_engine', None)
+                if se:
+                    zone = se.get_best_entry_zone(side, current_price, now_ms)
+                    if zone is None:
+                        rej_key = f"NO_ZONE_{side}"
+                        if self._should_log_rejection(side, rej_key, now_ms):
+                            logger.info(f"⛔ {side.upper()}: Price not in any OB/FVG zone")
+                        continue
+                    zone_lo, zone_hi, zone_type = zone
+                    logger.info(
+                        f"✅ Price in {zone_type} zone ${zone_lo:,.0f}-${zone_hi:,.0f}"
+                    )
 
                 # ── PASSED ALL GATES — attempt entry ──────────────────────
                 # Only log "PASSED" once per rejection cycle (not every 5s)
@@ -2264,6 +2278,32 @@ class AdvancedICTStrategy:
         if side == "short" and self.htf_bias == "BULLISH":
             return False, "HTF BULLISH blocks short"
 
+        # ── BIAS CONFLICT GATE (v11) ──────────────────────────────────────
+        # If HTF and Daily bias CONFLICT, require higher conviction
+        if side == "long" and self.htf_bias == "BULLISH" and self.daily_bias == "BEARISH":
+            if self.htf_bias_strength < 0.80:
+                return False, (
+                    f"BIAS CONFLICT: HTF BULLISH ({self.htf_bias_strength:.0%}) "
+                    f"vs Daily BEARISH — need HTF >= 80% to override"
+                )
+        if side == "short" and self.htf_bias == "BEARISH" and self.daily_bias == "BULLISH":
+            if self.htf_bias_strength < 0.80:
+                return False, (
+                    f"BIAS CONFLICT: HTF BEARISH ({self.htf_bias_strength:.0%}) "
+                    f"vs Daily BULLISH — need HTF >= 80% to override"
+                )
+
+        # ── REGIME GATE (v11) ─────────────────────────────────────────────
+        # In DISTRIBUTION regime, block LONGS (smart money distributing)
+        # In ACCUMULATION regime, block SHORTS (smart money accumulating)
+        rs = self.regime_engine.state
+        if rs.regime == "DISTRIBUTION" and side == "long":
+            if self.htf_bias_strength < 0.85:
+                return False, f"DISTRIBUTION regime blocks long (need HTF >= 85%)"
+        if rs.regime == "ACCUMULATION" and side == "short":
+            if self.htf_bias_strength < 0.85:
+                return False, f"ACCUMULATION regime blocks short (need HTF >= 85%)"
+
         # ── Minimum HTF strength (institutional-grade filter) ─────────────
         # Weak bias (50-64%) = uncertain market → do NOT trade.
         # Only strong conviction (≥65%) yields genuinely directional flow.
@@ -2368,19 +2408,29 @@ class AdvancedICTStrategy:
                 met.append("FVG_TOUCH")
             # Note: near-FVG proximity NOT counted (see note on OB above)
 
-        # E. Recent MSS in direction — MUST be after the sweep if a sweep exists.
-        #    A MSS that formed before the sweep cannot confirm the new direction.
+        # E. Recent MSS in direction — MUST be:
+        #    1. After the sweep (if sweep exists)
+        #    2. Within MSS_MAX_AGE_MINUTES (enforced strictly)
+        #    3. Impulse must be significant (body ratio >= 35%)
+        MSS_MAX_AGE_MS = config.MSS_MAX_AGE_MINUTES * 60 * 1000
         if ctx.mss_event is not None:
             ms = ctx.mss_event
             sweep_ts = ctx.sweep_pool.sweep_timestamp if ctx.sweep_pool else 0
-            if ms.timestamp >= sweep_ts:
-                met.append(f"MSS_{ms.structure_type}")
-            else:
-                # MSS formed before the sweep — old structure, not valid confirmation
+            age_ms = now - ms.timestamp
+
+            if age_ms > MSS_MAX_AGE_MS:
+                # MSS too old — not valid for entry
                 logger.debug(
-                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
-                    f"({(ms.timestamp - sweep_ts) / 60_000:.0f}m earlier) — not counted"
+                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] "
+                    f"is {age_ms / 60_000:.0f}m old (max {config.MSS_MAX_AGE_MINUTES}m) — expired"
                 )
+            elif ms.timestamp < sweep_ts:
+                # MSS formed before the sweep — old structure
+                logger.debug(
+                    f"L2: MSS_{ms.structure_type} predates sweep — not counted"
+                )
+            else:
+                met.append(f"MSS_{ms.structure_type}")
 
         return len(met), met
 
@@ -2465,9 +2515,28 @@ class AdvancedICTStrategy:
 
             # ── 3. Order Block (0-30) ──────────────────────────────────
             obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
+            # Get ATR for OB quality filter
+            _atr_val = 0.0
+            try:
+                _dm_ref = getattr(self, '_last_data_manager_ref', None)
+                if _dm_ref:
+                    _c5m_ref = _dm_ref.get_candles("5m") or []
+                    if _c5m_ref:
+                        _atr_val = _atr(_c5m_ref, config.SL_ATR_PERIOD)
+            except Exception:
+                pass
             for ob in sorted([o for o in obs if o.is_active(now_ms)],
                              key=lambda x: x.strength, reverse=True):
                 virgin_m = ob.virgin_multiplier()
+
+                # OB QUALITY FILTER (v11)
+                # Skip OBs that are too small relative to ATR (not institutional)
+                if _atr_val > 0 and ob.size < _atr_val * 0.3:
+                    continue  # OB too small — not institutional
+
+                # Penalize heavily-visited OBs (diminishing returns)
+                if ob.visit_count >= 2:
+                    virgin_m = 0.40  # 60% penalty on 2+ visits
 
                 if ob.contains_price(current_price) or ob.in_optimal_zone(current_price):
                     in_ote = ob.in_optimal_zone(current_price)
