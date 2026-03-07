@@ -201,6 +201,18 @@ class FuturesWebSocket:
         """✅ CRITICAL FIX: Resubscribe to all previous subscriptions after reconnect"""
         with self._subscriptions_lock:
             logger.info("🔄 Resubscribing to all streams after reconnect...")
+
+            # ✅ FIX: Clear all callback lists before resubscribing.
+            # Without this, each reconnect appends duplicate callbacks because
+            # subscribe_* methods re-register the same functions, and the
+            # 'if callback not in' guard only works if the list was not cleared.
+            # We MUST wipe here so callers can safely call subscribe_* again.
+            with self._callbacks_lock:
+                self.orderbook_callbacks.clear()
+                self.candlestick_callbacks.clear()
+                self.trades_callbacks.clear()
+                self.ticker_callbacks.clear()
+            logger.info("🧹 Callback lists cleared before resubscription")
             
             # Resubscribe orderbook
             for sub in self._subscriptions["orderbook"]:

@@ -322,7 +322,7 @@ class AdvancedICTStrategy:
     """
 
     _STRUCTURE_UPDATE_MS = getattr(config, "STRUCTURE_UPDATE_INTERVAL_SECONDS", 30) * 1000
-    _ENTRY_EVAL_MS       = getattr(config, "ENTRY_EVALUATION_INTERVAL_SECONDS", 5) * 1000
+    # NOTE: _ENTRY_EVAL_MS removed — entry is evaluated every tick for precise timing
 
     def __init__(self, order_manager):
         self._order_manager = order_manager
@@ -356,8 +356,9 @@ class AdvancedICTStrategy:
         self.swing_lows:        deque = deque(maxlen=300)
         self.market_structures: deque = deque(maxlen=150)
 
-        # Dedup
-        self._registered_sweeps: set = set()
+        # Dedup — capped deque prevents unbounded growth (memory leak fix)
+        # maxlen=2000: at ~1 sweep/min that is ~33 hours of history before eviction
+        self._registered_sweeps: deque = deque(maxlen=2000)
 
         # Session / AMD
         self.current_session = "REGULAR"
@@ -401,7 +402,7 @@ class AdvancedICTStrategy:
 
         # Timing
         self._last_structure_update_ms = 0
-        self._last_entry_eval_ms       = 0
+        # self._last_entry_eval_ms removed — entry eval runs every tick
         self._last_outlook_ms          = 0
         self._placement_locked_until   = 0
         self._last_sl_update_time      = 0
@@ -502,9 +503,7 @@ class AdvancedICTStrategy:
                 self._manage_active_position(data_manager, order_manager, current_price, current_time)
 
             elif self.state == "READY":
-                if (current_time - self._last_entry_eval_ms) >= self._ENTRY_EVAL_MS:
-                    self._evaluate_entry(data_manager, order_manager, risk_manager, current_time)
-                    self._last_entry_eval_ms = current_time
+                self._evaluate_entry(data_manager, order_manager, risk_manager, current_time)
 
         except Exception as e:
             logger.error(f"❌ on_tick error: {e}", exc_info=True)
@@ -611,28 +610,72 @@ class AdvancedICTStrategy:
 
             send_telegram_message("\n".join(init_lines))
 
-            # ── STARTUP RECONCILIATION ────────────────────────────────
-            # Check if there's an existing position on the exchange
-            # (e.g. from a partial fill that survived a restart,
-            #  or from a previous session that wasn't cleanly closed).
+            # ── STARTUP RECONCILIATION ────────────────────────────────────────
+            # Query the exchange on every cold start. If a position is open
+            # (e.g. bot was restarted mid-trade) we rebuild internal state so
+            # the SL trailing and TP management loops stay in control.
+            # Without this the bot wakes up as READY, ignores the live position,
+            # and the exchange orders run unmanaged until manually closed.
             try:
                 pos = self._order_manager.get_open_position()
                 if pos and pos.get("side") and pos.get("size", 0) > 0:
+                    restored_side  = pos["side"]
+                    restored_entry = float(pos.get("entry_price", 0))
+                    restored_size  = float(pos["size"])
+
                     logger.warning(
-                        f"⚠️ STARTUP: Existing {pos['side']} position detected "
-                        f"on exchange: size={pos['size']} "
-                        f"entry=${pos.get('entry_price', 0):,.2f}")
+                        f"⚠️ STARTUP RECOVERY: Restoring {restored_side} position "
+                        f"size={restored_size} entry=${restored_entry:,.2f}")
+
+                    # Rebuild active_position dict (mirrors what _place_entry sets)
+                    self.active_position = {
+                        "side":        restored_side,
+                        "size":        restored_size,
+                        "entry_price": restored_entry,
+                    }
+                    self.initial_entry_price = restored_entry
+
+                    # Recover open SL and TP order IDs from the exchange order list
+                    open_orders_resp = self._order_manager.api.get_open_orders(
+                        exchange=config.EXCHANGE, symbol=config.SYMBOL)
+                    if isinstance(open_orders_resp, dict) and not open_orders_resp.get("error"):
+                        raw_orders = open_orders_resp.get("data", [])
+                        if isinstance(raw_orders, dict):
+                            raw_orders = [raw_orders]
+                        for o in (raw_orders or []):
+                            otype = str(o.get("order_type", "")).upper()
+                            oid   = o.get("order_id") or o.get("id")
+                            tprice = o.get("trigger_price")
+                            if oid and otype in ("STOP_MARKET", "STOP_LOSS_MARKET"):
+                                self.sl_order_id = str(oid)
+                                if tprice:
+                                    self.current_sl_price = float(tprice)
+                                logger.info(f"  ↳ Recovered SL order: {oid} @ {tprice}")
+                            elif oid and otype in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT"):
+                                self.tp_order_id = str(oid)
+                                if tprice:
+                                    self.current_tp_price = float(tprice)
+                                logger.info(f"  ↳ Recovered TP order: {oid} @ {tprice}")
+
+                    # Switch the state machine to active — the management loop
+                    # (_manage_active_position) will now run on every tick.
+                    self.state = "POSITION_ACTIVE"
+
                     send_telegram_message(
-                        f"⚠️ <b>STARTUP RECONCILIATION</b>\n"
-                        f"Existing {pos['side']} position found:\n"
-                        f"  Size: {pos['size']} BTC\n"
-                        f"  Entry: ${pos.get('entry_price', 0):,.2f}\n"
-                        f"  uPnL: ${pos.get('unrealized_pnl', 0):+.2f}\n\n"
-                        f"⚠️ Bot will monitor but NOT manage this position.\n"
-                        f"Verify SL/TP orders are in place on exchange."
+                        f"🔄 <b>STARTUP RECOVERY</b> — Position Restored\n"
+                        f"Side: <b>{restored_side}</b>\n"
+                        f"Entry: ${restored_entry:,.2f}  |  Size: {restored_size} BTC\n"
+                        f"SL order: {self.sl_order_id or '⚠️ MISSING'} "
+                        f"@ ${self.current_sl_price or 0:,.2f}\n"
+                        f"TP order: {self.tp_order_id or '⚠️ MISSING'} "
+                        f"@ ${self.current_tp_price or 0:,.2f}\n"
+                        f"✅ Bot will manage this position normally."
                     )
+                else:
+                    logger.info("✅ STARTUP: No open position — starting fresh.")
+
             except Exception as e:
-                logger.warning(f"Startup reconciliation check failed: {e}")
+                logger.warning(f"Startup reconciliation failed: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"❌ Initialization error: {e}", exc_info=True)
@@ -1393,7 +1436,7 @@ class AdvancedICTStrategy:
                         pool.sweep_timestamp = current_time
                         pool.wick_rejection = wick_ok
                         pool.displacement_confirmed = disp_ok
-                        self._registered_sweeps.add(dedup_k)
+                        self._registered_sweeps.append(dedup_k)
                         logger.info(f"💧 EQH swept @ ${pool.price:.0f} wick={wick_ok} disp={disp_ok}")
                         break
 
@@ -1405,7 +1448,7 @@ class AdvancedICTStrategy:
                         pool.sweep_timestamp = current_time
                         pool.wick_rejection = wick_ok
                         pool.displacement_confirmed = disp_ok
-                        self._registered_sweeps.add(dedup_k)
+                        self._registered_sweeps.append(dedup_k)
                         logger.info(f"💧 EQL swept @ ${pool.price:.0f} wick={wick_ok} disp={disp_ok}")
                         break
 

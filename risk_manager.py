@@ -146,11 +146,12 @@ class RiskManager:
         Calculate position size (BTC quantity to send to exchange).
 
         Industry-standard risk-based sizing:
-          1. Dollar risk = BALANCE_USAGE_PERCENTAGE% of available balance
-             (treated as the maximum dollar loss if SL hits)
+          1. Dollar risk = RISK_PER_TRADE% of available balance
+             (the maximum dollar loss accepted if SL fires, e.g. 0.60% of balance)
           2. Notional = dollar_risk / sl_distance_pct
           3. qty (BTC) = notional / entry_price
-          4. Margin cap: if margin_required > MAX_MARGIN_PER_TRADE, scale down
+          4. Margin cap: if margin > BALANCE_USAGE_PERCENTAGE% of balance or
+             MAX_MARGIN_PER_TRADE, scale down (capital allocation guard)
           5. Apply MIN/MAX_POSITION_SIZE hard limits
 
         NOTE: No division by LEVERAGE here.  The exchange uses the qty you
@@ -203,9 +204,11 @@ class RiskManager:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
 
             # ── Step 1: Dollar risk budget ────────────────────────────
-            # BALANCE_USAGE_PERCENTAGE is the % of balance we accept losing
-            # on one trade if the SL fires (our dollar risk amount).
-            dollar_risk = available * (config.BALANCE_USAGE_PERCENTAGE / 100)
+            # RISK_PER_TRADE is the % of balance we accept LOSING if SL fires.
+            # e.g. RISK_PER_TRADE=0.60 → risk $6 on a $1000 balance.
+            # BALANCE_USAGE_PERCENTAGE is a margin/capital allocation cap used
+            # only in Step 3, NOT as the risk input here.
+            dollar_risk = available * (config.RISK_PER_TRADE / 100)
             dollar_risk = max(config.MIN_MARGIN_PER_TRADE,
                               min(dollar_risk, config.MAX_MARGIN_PER_TRADE))
 
