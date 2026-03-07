@@ -26,21 +26,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import config
-from structure_engine import (
-    StructureEngine, TrendState,
-    SwingPoint as SESwingPoint,
-    MarketStructureShift,
-    OrderBlock as SEOrderBlock,
-    FairValueGap as SEFairValueGap,
-    LiquidityPool as SELiquidityPool,
-    _atr,
-)
 from telegram_notifier import (
     send_telegram_message, format_market_outlook,
     format_entry_alert, format_trail_update,
     format_position_close, format_rejection_log,
 )
 from order_manager import GlobalRateLimiter, CancelResult
+from structure_engine import StructureEngine, _atr as compute_atr
 from regime_engine import (
     RegimeEngine, RegimeSnapshot, NestedDealingRanges,
     REGIME_TRENDING_BULL, REGIME_TRENDING_BEAR,
@@ -344,8 +336,9 @@ class AdvancedICTStrategy:
         self.volume_analyzer = VolumeProfileAnalyzer()
         self.absorption_model = AbsorptionModel()
 
-        # v11: Centralized structure detection
+        # v11: Centralized structure detection engine
         self.structure_engine = StructureEngine()
+        self._data_manager = None   # set on first on_tick
 
         # HTF Bias
         self.htf_bias             = "NEUTRAL"
@@ -457,7 +450,7 @@ class AdvancedICTStrategy:
         self._tp_guardian_stop:   threading.Event = threading.Event()
         self._tp_guardian_thread: Optional[threading.Thread] = None
 
-        logger.info("✅ AdvancedICTStrategy v10 created (single TP/SL, structure trailing)")
+        logger.info("✅ AdvancedICTStrategy v11 created (single TP/SL, structure trailing, sniper entry)")
 
     # ==================================================================
     # PUBLIC ACCESSORS
@@ -475,6 +468,8 @@ class AdvancedICTStrategy:
         try:
             if self._risk_manager is None:
                 self._risk_manager = risk_manager
+            if self._data_manager is None:
+                self._data_manager = data_manager
 
             if not data_manager.is_ready:
                 return
@@ -520,7 +515,8 @@ class AdvancedICTStrategy:
 
     def _run_initialization(self, data_manager, current_time: int) -> None:
         try:
-            logger.info("🔧 Strategy v10 initialization starting...")
+            logger.info("🔧 Strategy v11 initialization starting...")
+            self._data_manager = data_manager   # v11: store reference
             current_price = data_manager.get_last_price()
             if not current_price:
                 return
@@ -535,32 +531,23 @@ class AdvancedICTStrategy:
                 logger.warning("⏳ Insufficient 5m candles — waiting...")
                 return
 
-            # Detect structures on all timeframes
-            self._detect_swing_points(c5m, current_price, "5m")
-            if c15m:
-                self._detect_swing_points(c15m, current_price, "15m")
-            if c1h:
-                self._detect_swing_points(c1h, current_price, "1h")
-            if c4h:
-                self._detect_swing_points(c4h, current_price, "4h")
+            # v11: Use StructureEngine for all detection
+            candles_by_tf = {"5m": c5m}
+            if c15m: candles_by_tf["15m"] = c15m
+            if c1h:  candles_by_tf["1h"] = c1h
+            if c4h:  candles_by_tf["4h"] = c4h
 
-            self._detect_market_structure(c5m, current_price, current_time, "5m")
-            if len(c15m) >= 10:
-                self._detect_market_structure(c15m, current_price, current_time, "15m")
-            if len(c1h) >= 10:
-                self._detect_market_structure(c1h, current_price, current_time, "1h")
-            if len(c4h) >= 10:
-                self._detect_market_structure(c4h, current_price, current_time, "4h")
+            self.structure_engine.update(candles_by_tf, current_price, current_time)
 
-            self._detect_order_blocks(c5m, current_time, current_price, "5m")
-            if len(c15m) >= 5:
-                self._detect_order_blocks(c15m, current_time, current_price, "15m")
-
-            self._detect_fvgs(c5m, current_time, current_price, "5m")
-            if len(c15m) >= 5:
-                self._detect_fvgs(c15m, current_time, current_price, "15m")
-
-            self._detect_liquidity_pools(current_price, current_time)
+            # Sync results
+            self.swing_highs       = self.structure_engine.swing_highs
+            self.swing_lows        = self.structure_engine.swing_lows
+            self.market_structures = self.structure_engine.market_structures
+            self.order_blocks_bull = self.structure_engine.order_blocks_bull
+            self.order_blocks_bear = self.structure_engine.order_blocks_bear
+            self.fvgs_bull         = self.structure_engine.fvgs_bull
+            self.fvgs_bear         = self.structure_engine.fvgs_bear
+            self.liquidity_pools   = self.structure_engine.liquidity_pools
 
             # HTF bias
             self._update_htf_bias(c4h, c1d, current_price)
@@ -656,7 +643,7 @@ class AdvancedICTStrategy:
 
     def _update_all_structures(self, data_manager, current_price: float,
                                 current_time: int) -> None:
-        """v11: Delegates all structure detection to StructureEngine."""
+        """v11: Delegates structure detection to StructureEngine, syncs results."""
         try:
             c1m  = data_manager.get_candles("1m")  or []
             c5m  = data_manager.get_candles("5m")  or []
@@ -673,18 +660,17 @@ class AdvancedICTStrategy:
                 self.volume_analyzer.on_candle(c5m[-1])
                 self.absorption_model.on_candle(c5m[-1])
 
-            # Run StructureEngine update
+            # Build candle map for structure engine
             candles_by_tf = {}
-            if c1m:  candles_by_tf["1m"] = c1m
             if c5m:  candles_by_tf["5m"] = c5m
             if c15m: candles_by_tf["15m"] = c15m
             if c1h:  candles_by_tf["1h"] = c1h
             if c4h:  candles_by_tf["4h"] = c4h
 
+            # v11: All detection through StructureEngine
             self.structure_engine.update(candles_by_tf, current_price, current_time)
 
-            # Sync structure engine results to strategy's fields
-            # (so existing logging/reporting code still works)
+            # Sync results so existing logging/reporting/scoring still works
             self.swing_highs       = self.structure_engine.swing_highs
             self.swing_lows        = self.structure_engine.swing_lows
             self.market_structures = self.structure_engine.market_structures
@@ -694,7 +680,7 @@ class AdvancedICTStrategy:
             self.fvgs_bear         = self.structure_engine.fvgs_bear
             self.liquidity_pools   = self.structure_engine.liquidity_pools
 
-            # HTF bias (keep existing logic but add conflict detection)
+            # HTF bias
             self._update_htf_bias(c4h, c1d, current_price)
             self._update_daily_bias(c5m, current_price)
 
@@ -946,7 +932,6 @@ class AdvancedICTStrategy:
                 return plan
 
             # Score confluence
-            self._last_data_manager_ref = data_manager
             score, reasons, ctx = self._score_confluence(side, current_price, data_manager, now_ms)
             plan["score"] = score
             plan["reasons"] = reasons
@@ -1916,17 +1901,40 @@ class AdvancedICTStrategy:
                 self.current_session = "REGULAR"
 
             # AMD phase based on killzone timing
+            # ICT AMD: divide each killzone into 3 phases
+            # First third = Accumulation (range building)
+            # Second third = Manipulation (false breakout / sweep)
+            # Final third = Distribution (the real move)
             if london_kz:
-                if utc_hour == config.PO3_LONDON_KILLZONE_START:
+                kz_start = config.PO3_LONDON_KILLZONE_START
+                kz_end = config.PO3_LONDON_KILLZONE_END
+                kz_len = kz_end - kz_start
+                elapsed = utc_hour - kz_start
+                if elapsed < kz_len / 3:
                     self.amd_phase = "ACCUMULATION"
-                elif utc_hour == config.PO3_LONDON_KILLZONE_START + 1:
+                elif elapsed < 2 * kz_len / 3:
                     self.amd_phase = "MANIPULATION"
                 else:
                     self.amd_phase = "DISTRIBUTION"
             elif ny_kz:
-                if utc_hour == config.PO3_NY_KILLZONE_START:
+                kz_start = config.PO3_NY_KILLZONE_START
+                kz_end = config.PO3_NY_KILLZONE_END
+                kz_len = kz_end - kz_start
+                elapsed = utc_hour - kz_start
+                if elapsed < kz_len / 3:
                     self.amd_phase = "ACCUMULATION"
-                elif utc_hour == config.PO3_NY_KILLZONE_START + 1:
+                elif elapsed < 2 * kz_len / 3:
+                    self.amd_phase = "MANIPULATION"
+                else:
+                    self.amd_phase = "DISTRIBUTION"
+            elif asia_kz:
+                kz_start = config.PO3_ASIA_KILLZONE_START
+                kz_end = config.PO3_ASIA_KILLZONE_END
+                kz_len = max(kz_end - kz_start, 1)
+                elapsed = utc_hour - kz_start
+                if elapsed < kz_len / 3:
+                    self.amd_phase = "ACCUMULATION"
+                elif elapsed < 2 * kz_len / 3:
                     self.amd_phase = "MANIPULATION"
                 else:
                     self.amd_phase = "DISTRIBUTION"
@@ -2074,7 +2082,6 @@ class AdvancedICTStrategy:
                     continue
 
                 # ── SCORE: Confluence scoring ──────────────────────────────
-                self._last_data_manager_ref = data_manager
                 score, reasons, ctx = self._score_confluence(
                     side, current_price, data_manager, now_ms)
 
@@ -2146,32 +2153,30 @@ class AdvancedICTStrategy:
 
                     if sl_anchor is not None:
                         sl_dist    = abs(current_price - sl_anchor)
-                        min_sl_req = atr_now * 0.5
+                        min_sl_req = atr_now * 1.0   # v11: minimum 1.0 ATR, was 0.5
                         if sl_dist < min_sl_req:
                             rej_key = f"SL_TIGHT_{side}"
                             if self._should_log_rejection(side, rej_key, now_ms):
                                 logger.info(
                                     f"⛔ {side.upper()} SL too tight: "
-                                    f"{sl_dist:.1f} < 0.5×ATR({atr_now:.1f})={min_sl_req:.1f} "
+                                    f"{sl_dist:.1f} < 1.0×ATR({atr_now:.1f})={min_sl_req:.1f} "
                                     f"— entry would be stopped by noise"
                                 )
                             continue
 
-                # ── v11: Verify price is actually in an entry zone ──
+                # ── PASSED ALL GATES — attempt entry ──────────────────────
+                # v11: Verify price is actually in an entry zone (OB or FVG)
                 se = getattr(self, 'structure_engine', None)
                 if se:
                     zone = se.get_best_entry_zone(side, current_price, now_ms)
                     if zone is None:
                         rej_key = f"NO_ZONE_{side}"
                         if self._should_log_rejection(side, rej_key, now_ms):
-                            logger.info(f"⛔ {side.upper()}: Price not in any OB/FVG zone")
+                            logger.info(f"⛔ {side.upper()}: Price not in any OB/FVG entry zone")
                         continue
                     zone_lo, zone_hi, zone_type = zone
-                    logger.info(
-                        f"✅ Price in {zone_type} zone ${zone_lo:,.0f}-${zone_hi:,.0f}"
-                    )
+                    logger.debug(f"✅ Price in {zone_type} zone ${zone_lo:,.0f}-${zone_hi:,.0f}")
 
-                # ── PASSED ALL GATES — attempt entry ──────────────────────
                 # Only log "PASSED" once per rejection cycle (not every 5s)
                 rej_key = f"PASSED_{side}_{score:.0f}"
                 is_retracement = self._is_retracement_trade(side)
@@ -2278,7 +2283,7 @@ class AdvancedICTStrategy:
         if side == "short" and self.htf_bias == "BULLISH":
             return False, "HTF BULLISH blocks short"
 
-        # ── BIAS CONFLICT GATE (v11) ──────────────────────────────────────
+        # ── BIAS CONFLICT GATE (v11) ──────────────────────────────────
         # If HTF and Daily bias CONFLICT, require higher conviction
         if side == "long" and self.htf_bias == "BULLISH" and self.daily_bias == "BEARISH":
             if self.htf_bias_strength < 0.80:
@@ -2293,18 +2298,18 @@ class AdvancedICTStrategy:
                     f"vs Daily BULLISH — need HTF >= 80% to override"
                 )
 
-        # ── REGIME GATE (v11) ─────────────────────────────────────────────
+        # ── REGIME GATE (v11) ─────────────────────────────────────────
         # In DISTRIBUTION regime, block LONGS (smart money distributing)
         # In ACCUMULATION regime, block SHORTS (smart money accumulating)
         rs = self.regime_engine.state
-        if rs.regime == "DISTRIBUTION" and side == "long":
+        if rs.regime == REGIME_DISTRIBUTION and side == "long":
             if self.htf_bias_strength < 0.85:
-                return False, f"DISTRIBUTION regime blocks long (need HTF >= 85%)"
-        if rs.regime == "ACCUMULATION" and side == "short":
+                return False, f"DISTRIBUTION regime blocks long (need HTF >= 85%, have {self.htf_bias_strength:.0%})"
+        if rs.regime == REGIME_ACCUMULATION and side == "short":
             if self.htf_bias_strength < 0.85:
-                return False, f"ACCUMULATION regime blocks short (need HTF >= 85%)"
+                return False, f"ACCUMULATION regime blocks short (need HTF >= 85%, have {self.htf_bias_strength:.0%})"
 
-        # ── Minimum HTF strength (institutional-grade filter) ─────────────
+        # ── Minimum HTF strength ─────────────────────────────────────
         # Weak bias (50-64%) = uncertain market → do NOT trade.
         # Only strong conviction (≥65%) yields genuinely directional flow.
         # Retracement trades use a lower bar (45%) because displacement itself
@@ -2410,8 +2415,8 @@ class AdvancedICTStrategy:
 
         # E. Recent MSS in direction — MUST be:
         #    1. After the sweep (if sweep exists)
-        #    2. Within MSS_MAX_AGE_MINUTES (enforced strictly)
-        #    3. Impulse must be significant (body ratio >= 35%)
+        #    2. Within MSS_MAX_AGE_MINUTES (ENFORCED strictly — v11 fix)
+        #    3. On a relevant timeframe
         MSS_MAX_AGE_MS = config.MSS_MAX_AGE_MINUTES * 60 * 1000
         if ctx.mss_event is not None:
             ms = ctx.mss_event
@@ -2425,9 +2430,10 @@ class AdvancedICTStrategy:
                     f"is {age_ms / 60_000:.0f}m old (max {config.MSS_MAX_AGE_MINUTES}m) — expired"
                 )
             elif ms.timestamp < sweep_ts:
-                # MSS formed before the sweep — old structure
+                # MSS formed before the sweep — old structure, not valid confirmation
                 logger.debug(
-                    f"L2: MSS_{ms.structure_type} predates sweep — not counted"
+                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
+                    f"({(ms.timestamp - sweep_ts) / 60_000:.0f}m earlier) — not counted"
                 )
             else:
                 met.append(f"MSS_{ms.structure_type}")
@@ -2515,26 +2521,17 @@ class AdvancedICTStrategy:
 
             # ── 3. Order Block (0-30) ──────────────────────────────────
             obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
-            # Get ATR for OB quality filter
-            _atr_val = 0.0
-            try:
-                _dm_ref = getattr(self, '_last_data_manager_ref', None)
-                if _dm_ref:
-                    _c5m_ref = _dm_ref.get_candles("5m") or []
-                    if _c5m_ref:
-                        _atr_val = _atr(_c5m_ref, config.SL_ATR_PERIOD)
-            except Exception:
-                pass
+            # v11: compute ATR for OB quality filter
+            c5m_for_atr = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
+            ob_atr = compute_atr(c5m_for_atr, 14) if len(c5m_for_atr) >= 15 else current_price * 0.002
             for ob in sorted([o for o in obs if o.is_active(now_ms)],
                              key=lambda x: x.strength, reverse=True):
-                virgin_m = ob.virgin_multiplier()
-
-                # OB QUALITY FILTER (v11)
-                # Skip OBs that are too small relative to ATR (not institutional)
-                if _atr_val > 0 and ob.size < _atr_val * 0.3:
+                # v11: OB quality filter — skip OBs too small relative to ATR
+                if ob_atr > 0 and ob.size < ob_atr * 0.3:
                     continue  # OB too small — not institutional
 
-                # Penalize heavily-visited OBs (diminishing returns)
+                virgin_m = ob.virgin_multiplier()
+                # v11: Penalize heavily-visited OBs more aggressively
                 if ob.visit_count >= 2:
                     virgin_m = 0.40  # 60% penalty on 2+ visits
 
@@ -2684,11 +2681,25 @@ class AdvancedICTStrategy:
             if current_time <= 0:
                 current_time = int(time.time() * 1000)
             tick   = config.TICK_SIZE
-            buffer = config.SL_BUFFER_TICKS * tick
+
+            # v11: ATR-based buffer instead of fixed ticks
+            c5m_data = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
+            atr = compute_atr(c5m_data, config.SL_ATR_PERIOD) if len(c5m_data) >= config.SL_ATR_PERIOD + 1 else current_price * 0.002
+            buffer = atr * config.SL_ATR_BUFFER_MULT
             entry_offset = config.LIMIT_ORDER_OFFSET_TICKS * tick
 
             if side == "long":
-                entry_price = current_price - entry_offset
+                # v11: SNIPER ENTRY — at OTE zone, not at current_price
+                entry_price = current_price
+                if ctx.trigger_ob and ctx.trigger_ob.in_optimal_zone(current_price):
+                    ote_lo, ote_hi = ctx.trigger_ob.ote_zone()
+                    entry_price = (ote_lo + ote_hi) / 2
+                elif ctx.trigger_ob and ctx.trigger_ob.contains_price(current_price):
+                    entry_price = ctx.trigger_ob.midpoint
+                elif ctx.trigger_fvg and ctx.trigger_fvg.is_price_in_gap(current_price):
+                    entry_price = ctx.trigger_fvg.midpoint
+                # Small offset for fill probability
+                entry_price -= entry_offset
 
                 # SL: Below triggering OB low, or below nearest swing low
                 sl_price = None
@@ -2704,10 +2715,17 @@ class AdvancedICTStrategy:
                     if not quiet: logger.warning("No valid SL structure for LONG — rejecting")
                     return None, None, None
 
-                sl_dist = (entry_price - sl_price) / entry_price
-                if sl_dist < config.MIN_SL_DISTANCE_PCT:
-                    sl_price = entry_price * (1 - config.MIN_SL_DISTANCE_PCT)
-                elif sl_dist > config.MAX_SL_DISTANCE_PCT:
+                # v11: ATR-based minimum SL distance (not just fixed %)
+                min_sl_dist = max(
+                    atr * config.SL_MIN_CLEARANCE_ATR_MULT,
+                    entry_price * config.MIN_SL_DISTANCE_PCT
+                )
+                sl_dist = entry_price - sl_price
+                if sl_dist < min_sl_dist:
+                    sl_price = entry_price - min_sl_dist
+
+                sl_dist_pct = (entry_price - sl_price) / entry_price
+                if sl_dist_pct > config.MAX_SL_DISTANCE_PCT:
                     if not quiet: logger.warning(f"SL too wide: {sl_dist*100:.2f}% — rejecting")
                     return None, None, None
 
@@ -2791,7 +2809,16 @@ class AdvancedICTStrategy:
                         return None, None, None
 
             else:  # short
-                entry_price = current_price + entry_offset
+                # v11: SNIPER ENTRY — at OTE zone, not at current_price
+                entry_price = current_price
+                if ctx.trigger_ob and ctx.trigger_ob.in_optimal_zone(current_price):
+                    ote_lo, ote_hi = ctx.trigger_ob.ote_zone()
+                    entry_price = (ote_lo + ote_hi) / 2
+                elif ctx.trigger_ob and ctx.trigger_ob.contains_price(current_price):
+                    entry_price = ctx.trigger_ob.midpoint
+                elif ctx.trigger_fvg and ctx.trigger_fvg.is_price_in_gap(current_price):
+                    entry_price = ctx.trigger_fvg.midpoint
+                entry_price += entry_offset
 
                 # SL above triggering OB high, or above nearest swing high
                 sl_price = None
@@ -2806,11 +2833,18 @@ class AdvancedICTStrategy:
                     if not quiet: logger.warning("No valid SL structure for SHORT — rejecting")
                     return None, None, None
 
-                sl_dist = (sl_price - entry_price) / entry_price
-                if sl_dist < config.MIN_SL_DISTANCE_PCT:
-                    sl_price = entry_price * (1 + config.MIN_SL_DISTANCE_PCT)
-                elif sl_dist > config.MAX_SL_DISTANCE_PCT:
-                    if not quiet: logger.warning(f"SL too wide: {sl_dist*100:.2f}% — rejecting")
+                # v11: ATR-based minimum SL distance
+                min_sl_dist = max(
+                    atr * config.SL_MIN_CLEARANCE_ATR_MULT,
+                    entry_price * config.MIN_SL_DISTANCE_PCT
+                )
+                sl_dist = sl_price - entry_price
+                if sl_dist < min_sl_dist:
+                    sl_price = entry_price + min_sl_dist
+
+                sl_dist_pct = (sl_price - entry_price) / entry_price
+                if sl_dist_pct > config.MAX_SL_DISTANCE_PCT:
+                    if not quiet: logger.warning(f"SL too wide: {sl_dist_pct*100:.2f}% — rejecting")
                     return None, None, None
 
                 risk = sl_price - entry_price

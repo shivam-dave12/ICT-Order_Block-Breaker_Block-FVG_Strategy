@@ -1,9 +1,10 @@
 """
-ICT Order Block Trading Bot v10
+ICT Order Block Trading Bot v11
 =================================
 ICT + SMC + FVG + OB + Liquidity Institutional Engine
 
 Single TP. Single SL. Structure-based trailing.
+Sniper entry at OTE zones. ATR-based SL.
 No fallbacks. No synthetic data. Pure market structure.
 """
 
@@ -59,8 +60,8 @@ class ICTBot:
     def initialize(self) -> bool:
         try:
             logger.info("=" * 80)
-            logger.info("🚀 ICT BOT v10 — INSTITUTIONAL ENGINE INITIALIZING")
-            logger.info("   Single TP | Single SL | Structure Trailing")
+            logger.info("🚀 ICT BOT v11 — INSTITUTIONAL ENGINE INITIALIZING")
+            logger.info("   Sniper OTE Entry | ATR-Based SL | Structure Trailing")
             logger.info("   ICT + SMC + FVG + OB + Liquidity")
             logger.info("=" * 80)
 
@@ -130,15 +131,15 @@ class ICTBot:
             self.running = True
 
             send_telegram_message(
-                "🚀 <b>ICT BOT v10 STARTED</b>\n\n"
+                "🚀 <b>ICT BOT v11 STARTED</b>\n\n"
                 "✅ WS + REST warmup OK\n"
-                "✅ Single TP / Single SL\n"
+                "✅ Sniper OTE Entry\n"
+                "✅ ATR-Based SL (not fixed %)\n"
                 "✅ Structure-based Trailing SL\n"
                 "✅ Nested Dealing Ranges (3-tier IPDA)\n"
-                "✅ Cascade Gate L1→L2→L3\n"
-                "✅ Regime-Aware Sizing\n"
+                "✅ Bias Conflict + Regime Gates\n"
                 "✅ No Fallbacks — Pure Structure")
-            logger.info("🚀 BOT RUNNING — v10 INSTITUTIONAL ENGINE")
+            logger.info("🚀 BOT RUNNING — v11 INSTITUTIONAL ENGINE")
             return True
 
         except Exception:
@@ -303,7 +304,7 @@ class ICTBot:
         logger.info("Stopping ICT bot...")
         self.running = False
 
-        stop_msg = "🛑 <b>ICT BOT v10 STOPPED</b>\nShut down gracefully"
+        stop_msg = "🛑 <b>ICT BOT v11 STOPPED</b>\nShut down gracefully"
         if self.strategy:
             pos = self.strategy.get_position()
             if pos:

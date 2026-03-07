@@ -172,7 +172,7 @@ class OrderManager:
     # 401 from CoinSwitch can be spurious under rapid sequential requests.
     # We retry up to this many times with increasing delays before giving up.
     _MAX_401_RETRIES          = 3
-    _401_RETRY_DELAY_SEC      = 12.0   # base delay; multiplied by attempt number
+    _401_RETRY_DELAY_SEC      = 2.0    # v11: was 12.0 — faster retry for time-sensitive entries
 
     def __init__(self):
         self.api = FuturesAPI(

@@ -122,7 +122,7 @@ MAX_ORDER_BLOCKS             = 20
 # ─────────────────────────────────────────────
 # FAIR VALUE GAPS (ICT)
 # ─────────────────────────────────────────────
-FVG_MIN_SIZE_PCT        = 0.020     # gap >= 0.020% of price
+FVG_MIN_SIZE_PCT        = 0.020     # gap >= 0.02% of price
 FVG_MAX_AGE_MINUTES     = 1440      # 24h — FVGs remain relevant for a full day
 FVG_FILL_INVALIDATION   = 1.0       # 100% fill = invalidated (must fully close the gap)
 MAX_FVGS                = 30
@@ -144,7 +144,7 @@ MAX_LIQUIDITY_ZONES      = 30
 # MARKET STRUCTURE (BOS / CHoCH)
 # ─────────────────────────────────────────────
 MSS_LOOKBACK_CANDLES     = 50
-MSS_MAX_AGE_MINUTES      = 45       # 45 min — recent MSS window for entry (enforced in L2)
+MSS_MAX_AGE_MINUTES      = 45       # recent MSS window for entry
 
 
 # ─────────────────────────────────────────────
@@ -166,12 +166,12 @@ HTF_BIAS_THRESHOLD       = 0.55     # 55% needed for directional bias
 # SESSIONS / KILLZONES (UTC)
 # ─────────────────────────────────────────────
 ENABLE_PO3_FILTER          = True
-PO3_LONDON_KILLZONE_START  = 2       # 02:00 UTC
-PO3_LONDON_KILLZONE_END    = 5       # 05:00 UTC
-PO3_NY_KILLZONE_START      = 8       # 08:00 UTC  (13:00 EST → 13:30 IST)
-PO3_NY_KILLZONE_END        = 11      # 11:00 UTC
-PO3_ASIA_KILLZONE_START    = 0       # 00:00 UTC
-PO3_ASIA_KILLZONE_END      = 2       # 02:00 UTC
+PO3_LONDON_KILLZONE_START  = 2       # 02:00 UTC (07:30 IST)
+PO3_LONDON_KILLZONE_END    = 5       # 05:00 UTC (10:30 IST)
+PO3_NY_KILLZONE_START      = 12      # 12:00 UTC (07:00 EST / 17:30 IST)
+PO3_NY_KILLZONE_END        = 15      # 15:00 UTC (10:00 EST / 20:30 IST)
+PO3_ASIA_KILLZONE_START    = 0       # 00:00 UTC (05:30 IST)
+PO3_ASIA_KILLZONE_END      = 3       # 03:00 UTC (08:30 IST)
 
 
 # ─────────────────────────────────────────────
@@ -180,8 +180,8 @@ PO3_ASIA_KILLZONE_END      = 2       # 02:00 UTC
 
 # ── Hard limits (used by _replace_sl_order emergency path — do not remove) ──
 SL_BUFFER_TICKS         = 5         # kept for emergency SL placement fallback
-MIN_SL_DISTANCE_PCT     = 0.004     # 0.4% — minimum SL distance from entry
-MAX_SL_DISTANCE_PCT     = 0.03      # 3%  — emergency wide-SL ceiling
+MIN_SL_DISTANCE_PCT     = 0.004     # 0.4% — minimum SL distance (~$272 at $68K, >1.5 ATR)
+MAX_SL_DISTANCE_PCT     = 0.03      # 3%  — tighter ceiling ($2040 at $68K)
 SL_MIN_IMPROVEMENT_PCT  = 0.001     # kept for non-trailing SL update guards
 SL_RATCHET_ONLY         = True      # SL can only move in favour, never back
 
@@ -201,8 +201,8 @@ SL_RATCHET_ONLY         = True      # SL can only move in favour, never back
 
 SL_ATR_PERIOD               = 14    # Wilder's ATR lookback (5m candles)
 #SL_BREAKEVEN_ATR_MULT       = 0.05  # BE SL = entry ± 0.05×ATR (tiny locked profit)
-SL_ATR_BUFFER_MULT          = 0.75  # structural buffer beyond swing/OB anchor
-SL_MIN_CLEARANCE_ATR_MULT   = 1.5  # SL must stay ≥ 1.5×ATR from current price
+SL_ATR_BUFFER_MULT          = 0.75   # structural buffer beyond swing/OB anchor
+SL_MIN_CLEARANCE_ATR_MULT   = 1.5   # SL must stay ≥ 1.5×ATR from current price
 SL_MIN_IMPROVEMENT_ATR_MULT = 0.1   # min SL move per update (avoids exchange spam)
 TRAIL_SWING_MAX_AGE_MS      = 14_400_000   # 4 h — discard structure older than this
 #SL_BREAKEVEN_LOCK_RR      = 0.25   # fraction of initial risk to lock as profit at BE (was atr*0.05 ≈ $10)
