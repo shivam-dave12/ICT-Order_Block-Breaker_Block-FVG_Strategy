@@ -27,6 +27,7 @@ import sys
 import traceback
 
 import telegram_config
+from telegram_notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,11 @@ class TelegramBotController:
 
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        # Sanitize HTML before sending to prevent "Unsupported start tag" 400 errors.
+        # Dynamic content (regime names, exit reasons, state strings, etc.) may contain
+        # characters that form invalid tags. Mirrors what telegram_notifier already does.
+        if parse_mode == "HTML":
+            text = _sanitize_html(text)
         payload = {
             "chat_id": self.chat_id,
             "text": text,
@@ -92,6 +98,19 @@ class TelegramBotController:
         if parse_mode:
             payload["parse_mode"] = parse_mode
         resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code == 400 and parse_mode == "HTML":
+            # Last-resort fallback: strip all tags and retry as plain text
+            import re as _re
+            plain = _re.sub(r'<[^>]+>', '', text, flags=_re.DOTALL)
+            plain_payload = {
+                "chat_id": self.chat_id,
+                "text": plain[:4000],
+                "disable_web_page_preview": True,
+            }
+            resp2 = requests.post(url, json=plain_payload, timeout=10)
+            if resp2.status_code == 200:
+                logger.warning("Telegram HTML parse error — sent as plain text fallback")
+                return True
         if resp.status_code != 200:
             logger.error(f"Telegram API error {resp.status_code}: {resp.text[:200]}")
         return resp.status_code == 200
@@ -647,7 +666,7 @@ class TelegramBotController:
             pnl = trade.get("net_pnl", 0)
             rr = trade.get("rr_achieved", 0)
             reason = trade.get("exit_reason", "?")
-            icon = "" if pnl >= 0 else ""
+            icon = "✅" if pnl >= 0 else "❌"
             lines.append(f"  {icon} {side} P&L: ${pnl:+,.2f} ({rr:+.1f}R) [{reason}]")
 
         stats = bot_instance.strategy.get_strategy_stats() if bot_instance.strategy else {}
