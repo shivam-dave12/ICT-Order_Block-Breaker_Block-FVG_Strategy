@@ -226,7 +226,7 @@ TP_STRUCTURE_BUFFER_PCT     = 0.001   # buffer inside structure target
 # ─────────────────────────────────────────────
 TICK_SIZE                = 0.1
 LIMIT_ORDER_OFFSET_TICKS = 5
-ORDER_TIMEOUT_SECONDS    = 600
+ORDER_TIMEOUT_SECONDS    = 600   # also controls entry-pending cancel (see ENTRY_PENDING_TIMEOUT_SECONDS)
 MAX_ORDER_RETRIES        = 2
 
 
@@ -254,7 +254,7 @@ HEALTH_CHECK_INTERVAL_SEC          = 12.0
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
 ENTRY_EVALUATION_INTERVAL_SECONDS  = 5
-ENTRY_PENDING_TIMEOUT_SECONDS      = 120
+ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS  # was 120 — use ORDER_TIMEOUT_SECONDS (600)
 
 
 # ─────────────────────────────────────────────
