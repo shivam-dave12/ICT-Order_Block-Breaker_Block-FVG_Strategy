@@ -129,6 +129,7 @@ class TelegramBotController:
                 {"command": "start", "description": "Start trading bot"},
                 {"command": "stop", "description": "Stop trading bot"},
                 {"command": "status", "description": "Full status + market overview"},
+                {"command": "thinking", "description": "Deep analysis: what bot plans next"},
                 {"command": "structures", "description": "ICT structure analysis"},
                 {"command": "position", "description": "Current position details"},
                 {"command": "trades", "description": "Recent trade history"},
@@ -150,7 +151,7 @@ class TelegramBotController:
             resp = requests.post(url, json=payload, timeout=10)
 
             if resp.status_code != 200:
-                logger.error(f"Command registration failed: {resp.text}")
+                logger.error(f"Telegram command registration failed: {resp.text}")
             else:
                 logger.info("Telegram commands registered successfully")
 
@@ -169,7 +170,7 @@ class TelegramBotController:
             parts = t.split(None, 1)
             cmd = parts[0].lower()
             args = parts[1] if len(parts) > 1 else ""
-            if cmd in ("start", "stop", "status", "structures", "position",
+            if cmd in ("start", "stop", "status", "thinking", "structures", "position",
                         "trades", "config", "pause", "resume", "balance",
                         "killswitch", "set", "help"):
                 return f"/{cmd}", args
@@ -192,6 +193,8 @@ class TelegramBotController:
                 return self._cmd_stop()
             elif cmd == "/status":
                 return self._cmd_status()
+            elif cmd == "/thinking":
+                return self._cmd_thinking()
             elif cmd == "/structures":
                 return self._cmd_structures()
             elif cmd == "/position":
@@ -226,6 +229,7 @@ class TelegramBotController:
             "/start — Start trading bot\n"
             "/stop — Stop trading bot\n"
             "/status — Full status + market\n"
+            "/thinking — Deep analysis: what bot plans next\n"
             "/structures — ICT structure map\n"
             "/position — Current position\n"
             "/trades — Recent trade history\n"
@@ -337,6 +341,152 @@ class TelegramBotController:
         except Exception as e:
             logger.error(f"Status error: {e}", exc_info=True)
             return f"Status error: {e}"
+
+    def _cmd_thinking(self) -> str:
+        """
+        Deep analysis: what the bot sees, what it plans, and what's blocking it.
+        Runs a full dry-run of the entry evaluation for both sides.
+        """
+        global bot_instance, bot_running
+        if not bot_running or not bot_instance:
+            return "Bot not running. Use /start"
+
+        try:
+            import config as cfg
+            bot = bot_instance
+            strat = bot.strategy
+            dm = bot.data_manager
+            rm = bot.risk_manager
+
+            if not strat or not dm or not rm:
+                return "Bot components not ready yet."
+
+            price = dm.get_last_price()
+            now_ms = int(time.time() * 1000)
+
+            lines = [f"<b>🧠 BOT THINKING @ ${price:,.1f}</b>\n"]
+
+            # ── 1. Market context ────────────────────────────────
+            rs = strat.regime_engine.state
+            lines.append(f"<b>Context</b>")
+            lines.append(f"  HTF: <b>{strat.htf_bias}</b> ({strat.htf_bias_strength:.0%})")
+            lines.append(f"  Daily: {strat.daily_bias}")
+            lines.append(f"  Regime: {rs.regime} (ADX {rs.adx:.1f}, ATR×{rs.atr_ratio:.2f})")
+            lines.append(f"  Session: {strat.current_session}"
+                         f"{' | KZ' if strat.in_killzone else ''}"
+                         f" | AMD: {strat.amd_phase}")
+            lines.append(f"  State: <b>{strat.state}</b>")
+
+            # ── Dealing ranges ──────────────────────────────────
+            ndr = strat._ndr
+            if ndr.daily:
+                d = ndr.daily
+                zone = d.zone_pct(price)
+                zone_label = "PREMIUM" if d.is_premium(price) else ("DISCOUNT" if d.is_discount(price) else "EQ")
+                lines.append(f"  DR Daily: ${d.low:,.0f}–${d.high:,.0f} ({zone_label} {zone*100:.0f}%)")
+            if ndr.intraday:
+                i = ndr.intraday
+                lines.append(f"  DR Intra: ${i.low:,.0f}–${i.high:,.0f}")
+
+            # ── Range-bound mode ────────────────────────────────
+            rb_active = strat._is_range_bound_mode()
+            if rb_active:
+                rb_dr = strat._get_range_bound_dr()
+                if rb_dr:
+                    z = rb_dr.zone_pct(price)
+                    lines.append(f"\n📊 <b>RANGE-BOUND MODE ACTIVE</b>")
+                    lines.append(f"  DR: ${rb_dr.low:,.0f}–${rb_dr.high:,.0f} (zone {z*100:.0f}%)")
+                    lines.append(f"  Long zone: below {cfg.RANGE_BOUND_DISCOUNT_ENTRY*100:.0f}% ({'✅ YES' if z <= cfg.RANGE_BOUND_DISCOUNT_ENTRY else '❌ NO'})")
+                    lines.append(f"  Short zone: above {cfg.RANGE_BOUND_PREMIUM_ENTRY*100:.0f}% ({'✅ YES' if z >= cfg.RANGE_BOUND_PREMIUM_ENTRY else '❌ NO'})")
+                    lines.append(f"  Trades today: {strat._range_bound_daily_trades}/{cfg.RANGE_BOUND_MAX_DAILY_TRADES}")
+            elif strat.htf_bias == "NEUTRAL":
+                lines.append(f"\n📊 Range-bound: INACTIVE")
+                if rs.adx > cfg.RANGE_BOUND_MAX_ADX:
+                    lines.append(f"  ❌ ADX {rs.adx:.1f} > {cfg.RANGE_BOUND_MAX_ADX} (too directional)")
+                rb_dr = strat._get_range_bound_dr()
+                if rb_dr is None:
+                    lines.append(f"  ❌ No valid DR within size bounds")
+
+            # ── 2. Risk manager gate ────────────────────────────
+            can_trade, risk_reason = rm.can_trade()
+            if can_trade:
+                lines.append(f"\n✅ Risk gate: CLEAR")
+            else:
+                lines.append(f"\n🚫 Risk gate: <b>BLOCKED</b>")
+                lines.append(f"  {risk_reason}")
+
+            # ── 3. Trade plans (dry-run both sides) ──────────────
+            for side in ["long", "short"]:
+                plan = strat._build_trade_plan(side, price, dm, now_ms)
+                status = plan.get("status", "?")
+                label = side.upper()
+                rb_tag = " [RANGE]" if plan.get("range_bound") else ""
+
+                lines.append(f"\n{'─' * 25}")
+                if status == "READY":
+                    lines.append(f"🎯 <b>{label}{rb_tag}: READY</b>")
+                    lines.append(f"  Entry: ${plan.get('entry', 0):,.1f}")
+                    lines.append(f"  SL: ${plan.get('sl', 0):,.1f} ({plan.get('sl_reason', '?')})")
+                    lines.append(f"  TP: ${plan.get('tp', 0):,.1f} ({plan.get('tp_reason', '?')})")
+                    lines.append(f"  RR: {plan.get('rr', 0):.1f}x")
+                    lines.append(f"  Score: {plan.get('score', 0):.0f}/{plan.get('threshold', 0):.0f}")
+                    if plan.get("reasons"):
+                        top = plan["reasons"][:5]
+                        lines.append(f"  Reasons: {', '.join(top)}")
+                else:
+                    icon = "⛔"
+                    lines.append(f"{icon} <b>{label}{rb_tag}: {status}</b>")
+                    gate = plan.get("gate_failed", "unknown")
+                    lines.append(f"  Reason: {gate}")
+
+                    # Show what's missing
+                    if plan.get("missing"):
+                        lines.append(f"  Need: {plan['missing']}")
+
+                    # Show partial score if we got that far
+                    if plan.get("score"):
+                        threshold = plan.get("threshold", 0)
+                        score = plan.get("score", 0)
+                        lines.append(f"  Score: {score:.0f}"
+                                     + (f"/{threshold:.0f}" if threshold else ""))
+                        if plan.get("reasons"):
+                            top = plan["reasons"][:4]
+                            lines.append(f"  {', '.join(top)}")
+
+            # ── 4. What needs to change ──────────────────────────
+            lines.append(f"\n{'─' * 25}")
+            lines.append(f"<b>What needs to change?</b>")
+
+            if strat.htf_bias == "NEUTRAL" and not rb_active:
+                lines.append("• HTF bias must become directional (BULLISH or BEARISH)")
+                lines.append("  OR ADX must drop below 22 for range-bound mode")
+            elif strat.htf_bias == "NEUTRAL" and rb_active:
+                lines.append("• Price must reach DR extremes (discount for long, premium for short)")
+
+            if not can_trade:
+                lines.append(f"• Risk gate: {risk_reason}")
+
+            if strat.state == "POSITION_ACTIVE":
+                lines.append("• Position already active — managing SL/TP")
+            elif strat.state == "ENTRY_PENDING":
+                lines.append("• Entry order pending fill")
+
+            # Nearest entry zones
+            se = getattr(strat, 'structure_engine', None)
+            if se:
+                for s in ["long", "short"]:
+                    zone = se.get_best_entry_zone(s, price, now_ms)
+                    if zone:
+                        z_lo, z_hi, z_type = zone
+                        dist = abs(price - (z_lo + z_hi) / 2) / price * 100
+                        lines.append(f"• Nearest {s.upper()} zone: {z_type} ${z_lo:,.0f}–${z_hi:,.0f} ({dist:.2f}% away)")
+
+            self.send_message("\n".join(lines))
+            return None
+
+        except Exception as e:
+            logger.error(f"Thinking error: {e}", exc_info=True)
+            return f"Error: {e}"
 
     def _cmd_structures(self) -> str:
         global bot_instance, bot_running
@@ -519,12 +669,13 @@ class TelegramBotController:
             if not bal:
                 return "Could not fetch balance."
             avail = float(bal.get("available", 0))
-            locked = float(bal.get("locked", 0))
+            total = float(bal.get("total", avail))
+            locked = total - avail
             return (
                 f"<b>Wallet Balance</b>\n"
                 f"Available: <b>${avail:,.2f}</b> USDT\n"
                 f"Locked: ${locked:,.2f} USDT\n"
-                f"Total: ${avail + locked:,.2f} USDT"
+                f"Total: ${total:,.2f} USDT"
             )
         except Exception as e:
             return f"Balance error: {e}"
@@ -572,6 +723,7 @@ class TelegramBotController:
             return "Bot not running."
 
         try:
+            import config
             # Pause trading first
             bot_instance.trading_enabled = False
 

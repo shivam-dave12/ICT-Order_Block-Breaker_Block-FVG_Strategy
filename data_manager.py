@@ -122,6 +122,13 @@ class ICTDataManager:
         # Thread safety
         self._lock = threading.RLock()
 
+        # ── Forming candle tracking ─────────────────────────────────────
+        # Tracks the start_time (ms) of the current forming (not-yet-closed)
+        # candle per timeframe.  Prevents overwriting historical closed candles
+        # when WS sends updates for the current forming period.
+        self._forming_ts: Dict[str, int] = {}   # {tf_key: start_time_ms}
+        self._warmup_complete: bool = False      # gate WS candles until REST fills deques
+
         # Indicator cache
 
         # Readiness
@@ -205,13 +212,15 @@ class ICTDataManager:
             logger.info("✓ WebSocket streams started successfully")
             logger.info("  - Order Book: Active")
             logger.info("  - Trades: Active")
-            logger.info("  - Candles: 1m, 5m, 15m, 1h, 4h, 1d")  # ← UPDATE
+            logger.info("  - Candles: 1m, 5m, 15m, 1h, 4h, 1d")
             
-            # ✅ CRITICAL: REST warmup so cold start has data immediately
-            # Rate-limit between calls to prevent 429 cascades
+            # ✅ CRITICAL: REST warmup BEFORE WS candle subscriptions
+            # WS candle callbacks check _warmup_complete before processing.
+            # This eliminates the race condition where WS candle arrives to an
+            # empty deque and gets falsely logged as "CLOSED".
             logger.info("Warming up candles from REST API...")
             self._warmup_from_klines_1m()
-            time.sleep(3.5)  # respect CoinSwitch 3s hard limit
+            time.sleep(3.5)   # respect CoinSwitch 3s hard limit
             self._warmup_from_klines_5m()
             time.sleep(3.5)
             self._warmup_from_klines_15m()
@@ -220,7 +229,11 @@ class ICTDataManager:
             time.sleep(3.5)
             self._warmup_from_klines_4h()
             time.sleep(3.5)
-            self._warmup_from_klines_1d()  
+            self._warmup_from_klines_1d()
+
+            # NOW safe to process WS candles — deques are populated
+            self._warmup_complete = True
+            logger.info("✅ REST warmup complete — WS candle processing enabled")  
             
             # Mark ready if minimum candles exist
             self.is_ready = self._check_minimum_data()
@@ -263,6 +276,8 @@ class ICTDataManager:
         """Restart WebSocket with state preservation"""
         try:
             logger.warning("Restarting streams (will re-warmup)")
+            self._warmup_complete = False
+            self._forming_ts.clear()
             self.stop()
             time.sleep(2.0)
             return self.start()
@@ -643,6 +658,59 @@ class ICTDataManager:
         return self.is_ready
 
     # -----------------------------------------------------------------
+    # WebSocket candle helper — correct forming/closed handling
+    # -----------------------------------------------------------------
+    def _process_ws_candle(self, data: Dict, candle: Candle,
+                           candle_deque: deque, tf_key: str,
+                           tf_label: str) -> None:
+        """
+        Correctly process a WS candle update for any timeframe.
+
+        Solves two critical bugs:
+        1. Pre-warmup race: if _warmup_complete is False, ignore WS candles
+           (REST will fill the deque with correct historical data).
+        2. Forming→closed transition: tracks forming candles by start_time
+           so we never overwrite a different period's closed candle.
+
+        Flow:
+        - is_closed=True, same start_ts as forming → finalize in place
+        - is_closed=True, new start_ts → append new closed candle
+        - is_closed=False, same start_ts as forming → update in place
+        - is_closed=False, new start_ts → append new forming candle
+        """
+        if not self._warmup_complete:
+            # Before warmup, only update _last_price (for readiness display)
+            self._last_price = candle.close
+            return
+
+        is_closed  = data.get('x', False)
+        start_ts   = int(data.get('t', 0))          # candle start time (ms)
+        forming_ts = self._forming_ts.get(tf_key)    # currently tracked forming start_ts
+
+        self._last_price = candle.close
+
+        if is_closed:
+            if forming_ts == start_ts and candle_deque:
+                # Finalize the forming candle we've been tracking
+                candle_deque[-1] = candle
+            else:
+                # Brand new closed candle (or first after warmup)
+                candle_deque.append(candle)
+            # Clear forming tracker — this period is done
+            self._forming_ts.pop(tf_key, None)
+            logger.info(f"✅ {tf_label} CLOSED @ ${candle.close:.2f} ({len(candle_deque)})")
+        else:
+            if forming_ts == start_ts and candle_deque:
+                # Same period update — overwrite in place
+                candle_deque[-1] = candle
+            else:
+                # New forming period — append (don't overwrite last closed)
+                candle_deque.append(candle)
+                self._forming_ts[tf_key] = start_ts
+
+        self.stats.record_candle()
+
+    # -----------------------------------------------------------------
     # WebSocket callbacks
     # -----------------------------------------------------------------
     def _on_orderbook_update(self, data: Dict) -> None:
@@ -701,10 +769,9 @@ class ICTDataManager:
     def _on_candlestick_1m(self, data: Dict) -> None:
         """Process 1m candlestick"""
         try:
-            # ✅ FIX: Validate interval matches expected timeframe
             interval = str(data.get('i', ''))
             if interval and interval != '1':
-                return  # Wrong interval routed here — skip
+                return
 
             with self._lock:
                 candle = Candle(
@@ -715,20 +782,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close          # ← FIXED
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_1m:
-                    self._candles_1m.append(candle)
-                    logger.info(f"✅ 1m CLOSED @ ${candle.close:.2f} ({len(self._candles_1m)})")
-                else:
-                    self._candles_1m[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_1m, '1', '1m')
         except Exception as e:
             logger.error(f"1m error: {e}")
 
@@ -739,7 +795,6 @@ class ICTDataManager:
             interval = str(data.get('i', ''))
             if interval and interval != '5':
                 return
-
             with self._lock:
                 candle = Candle(
                     timestamp=float(data.get('t', 0)) / 1000.0,
@@ -749,20 +804,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close          # ← FIXED
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_5m:
-                    self._candles_5m.append(candle)
-                    logger.info(f"✅ 5m CLOSED @ ${candle.close:.2f} ({len(self._candles_5m)})")
-                else:
-                    self._candles_5m[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_5m, '5', '5m')
         except Exception as e:
             logger.error(f"5m error: {e}")
 
@@ -773,7 +817,6 @@ class ICTDataManager:
             interval = str(data.get('i', ''))
             if interval and interval != '15':
                 return
-
             with self._lock:
                 candle = Candle(
                     timestamp=float(data.get('t', 0)) / 1000.0,
@@ -783,20 +826,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close          # ← FIXED
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_15m:
-                    self._candles_15m.append(candle)
-                    logger.info(f"✅ 15m CLOSED @ ${candle.close:.2f} ({len(self._candles_15m)})")
-                else:
-                    self._candles_15m[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_15m, '15', '15m')
         except Exception as e:
             logger.error(f"15m error: {e}")
 
@@ -806,7 +838,6 @@ class ICTDataManager:
             interval = str(data.get('i', ''))
             if interval and interval != '60':
                 return
-
             with self._lock:
                 candle = Candle(
                     timestamp=float(data.get('t', 0)) / 1000.0,
@@ -816,20 +847,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_1h:
-                    self._candles_1h.append(candle)
-                    logger.info(f"✅ 1h CLOSED @ ${candle.close:.2f} ({len(self._candles_1h)})")
-                else:
-                    self._candles_1h[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_1h, '60', '1h')
         except Exception as e:
             logger.error(f"1h error: {e}")
 
@@ -840,7 +860,6 @@ class ICTDataManager:
             interval = str(data.get('i', ''))
             if interval and interval != '240':
                 return
-
             with self._lock:
                 candle = Candle(
                     timestamp=float(data.get('t', 0)) / 1000.0,
@@ -850,20 +869,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close          # ← FIXED
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_4h:
-                    self._candles_4h.append(candle)
-                    logger.info(f"✅ 4h CLOSED @ ${candle.close:.2f} ({len(self._candles_4h)})")
-                else:
-                    self._candles_4h[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_4h, '240', '4h')
         except Exception as e:
             logger.error(f"4h error: {e}")
 
@@ -873,7 +881,6 @@ class ICTDataManager:
             interval = str(data.get('i', ''))
             if interval and interval != '1440':
                 return
-
             with self._lock:
                 candle = Candle(
                     timestamp=float(data.get('t', 0)) / 1000.0,
@@ -883,20 +890,9 @@ class ICTDataManager:
                     close=float(data.get('c', 0)),
                     volume=float(data.get('v', 0)),
                 )
-
                 if candle.close <= 0:
                     return
-
-                self._last_price = candle.close
-                is_closed = data.get('x', False)
-
-                if is_closed or not self._candles_1d:
-                    self._candles_1d.append(candle)
-                    logger.info(f"✅ 1d CLOSED @ ${candle.close:.2f} ({len(self._candles_1d)})")
-                else:
-                    self._candles_1d[-1] = candle
-
-                self.stats.record_candle()
+                self._process_ws_candle(data, candle, self._candles_1d, '1440', '1d')
         except Exception as e:
             logger.error(f"1d error: {e}")
 
