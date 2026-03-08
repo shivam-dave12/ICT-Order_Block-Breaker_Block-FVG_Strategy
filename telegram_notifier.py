@@ -76,6 +76,24 @@ def _sanitize_html(text: str) -> str:
 
     text = re.sub(r'<([^>]*)>', _fix_tag, text)
 
+    # Escape any remaining bare `<` that are NOT the opening of a valid Telegram
+    # HTML tag.  These arise from dynamic content such as numeric comparisons
+    # ("adx < 5.0", "price < sl"), f-strings with dict reprs ("<class ...>"),
+    # or reason strings returned by strategy internals.
+    #
+    # After the tag-stripping pass above, the only `<` chars that should remain
+    # are those starting recognised safe tags.  Anything else must be escaped
+    # so Telegram's HTML parser doesn't choke on them.
+    #
+    # Matches `<` NOT followed by an optional `/` and then a valid tag name:
+    #   b, i, u, s, code, pre, tg-spoiler, a (with optional attrs)
+    text = re.sub(
+        r'<(?!/?(?:b|i|u|s|code|pre|tg-spoiler|a(?:[\s>\/]|$)))(?![^>]*>)',
+        r'&lt;',
+        text,
+        flags=re.IGNORECASE,
+    )
+
     # Collapse excessive blank lines (> 2 consecutive newlines → 2)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text
