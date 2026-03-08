@@ -7,7 +7,7 @@ import logging
 import time
 import threading
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from collections import deque
 
@@ -58,7 +58,7 @@ class RiskManager:
         self.balance_cache_ttl = config.BALANCE_CACHE_TTL_SEC
 
         # Daily reset tracking — date-anchored, not trade-count dependent
-        self._last_reset_date = datetime.utcnow().date()
+        self._last_reset_date = datetime.now(timezone.utc).date()
 
         # Shared API (avoid redundant connections)
         if shared_api is not None:
@@ -465,7 +465,7 @@ class RiskManager:
         3. Reset is now DATE-anchored (self._last_reset_date), not dependent
            on having trade records. Even on days with 0 trades, the reset fires.
         """
-        today = datetime.utcnow().date()
+        today = datetime.now(timezone.utc).date()
 
         if not hasattr(self, '_last_reset_date'):
             self._last_reset_date = today

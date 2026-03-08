@@ -408,7 +408,7 @@ class AdvancedICTStrategy:
         self._last_sl_update_time      = 0
         self._last_sl_health_check     = 0
         self._last_pos_check_time      = 0      # throttle _check_position_closed
-        _POS_CHECK_INTERVAL_SEC        = 5.0    # check every 5s, not every 250ms tick
+        self._POS_CHECK_INTERVAL_SEC   = 5.0    # check every 5s, not every 250ms tick
 
         # Outlook interval (5 minutes)
         self._OUTLOOK_INTERVAL_MS = getattr(config, "OUTLOOK_INTERVAL_SECONDS", 300) * 1000
@@ -1036,8 +1036,10 @@ class AdvancedICTStrategy:
                 return plan
 
             # Calculate levels (dry run)
+            rb_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8) if self._range_bound_active else 0.0
             entry_price, sl_price, tp_price = self._calculate_levels(
-                side, current_price, ctx, current_time=now_ms, quiet=True)
+                side, current_price, ctx, current_time=now_ms, quiet=True,
+                min_rr_override=rb_rr)
             if entry_price is None:
                 plan["status"] = "NO_STRUCTURE"
                 plan["gate_failed"] = "Cannot calculate valid SL/TP from structure"
@@ -1047,7 +1049,13 @@ class AdvancedICTStrategy:
             reward = abs(tp_price - entry_price)
             rr = reward / risk if risk > 0 else 0
 
-            plan["status"] = "READY" if rr >= config.MIN_RISK_REWARD_RATIO - 1e-9 else "LOW_RR"
+            # Determine the effective minimum RR for status classification
+            if self._range_bound_active:
+                effective_min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
+            else:
+                effective_min_rr = config.MIN_RISK_REWARD_RATIO
+
+            plan["status"] = "READY" if rr >= effective_min_rr - 1e-9 else "LOW_RR"
             plan["entry"] = entry_price
             plan["sl"] = sl_price
             plan["tp"] = tp_price
@@ -1075,13 +1083,12 @@ class AdvancedICTStrategy:
             if "tp_reason" not in plan:
                 plan["tp_reason"] = "opposing structure"
 
-            # Range-bound mode uses different RR minimum
+            # Set range_bound flag and gate_failed if RR is below minimum
             if self._range_bound_active:
-                rb_min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
                 plan["range_bound"] = True
-                if rr < rb_min_rr - 1e-9:
-                    plan["gate_failed"] = f"RR {rr:.1f}x (min {rb_min_rr}x range-bound)"
-            elif rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
+                if rr < effective_min_rr - 1e-9:
+                    plan["gate_failed"] = f"RR {rr:.1f}x (min {effective_min_rr}x range-bound)"
+            elif rr < effective_min_rr - 1e-9:
                 plan["gate_failed"] = f"RR {rr:.1f}x (min {config.MIN_RISK_REWARD_RATIO}x)"
 
             return plan
@@ -1945,63 +1952,63 @@ class AdvancedICTStrategy:
 
     def _update_session_and_killzone(self, current_time: int) -> None:
         try:
-            utc_hour = datetime.fromtimestamp(current_time / 1000, tz=timezone.utc).hour
-            weekday  = datetime.fromtimestamp(current_time / 1000, tz=timezone.utc).weekday()
+            dt = datetime.fromtimestamp(current_time / 1000, tz=timezone.utc)
+            weekday = dt.weekday()                    # 0=Mon … 6=Sun
+            # ── Float hour for minute-resolution killzone & AMD ───────
+            utc_hour_f = dt.hour + dt.minute / 60.0   # e.g. 12:45 → 12.75
 
-            is_weekend = weekday >= 5
+            is_weekend = weekday >= 5  # Saturday, Sunday
 
-            london_kz = config.PO3_LONDON_KILLZONE_START <= utc_hour < config.PO3_LONDON_KILLZONE_END
-            ny_kz     = config.PO3_NY_KILLZONE_START <= utc_hour < config.PO3_NY_KILLZONE_END
-            asia_kz   = config.PO3_ASIA_KILLZONE_START <= utc_hour < config.PO3_ASIA_KILLZONE_END
+            # ── Killzone detection (float comparison, minute-accurate) ─
+            london_kz = config.PO3_LONDON_KILLZONE_START <= utc_hour_f < config.PO3_LONDON_KILLZONE_END
+            ny_kz     = config.PO3_NY_KILLZONE_START     <= utc_hour_f < config.PO3_NY_KILLZONE_END
+            asia_kz   = config.PO3_ASIA_KILLZONE_START   <= utc_hour_f < config.PO3_ASIA_KILLZONE_END
 
-            self.in_killzone = london_kz or ny_kz or asia_kz
+            # ── Weekend: killzones are unreliable (thin liquidity, no ──
+            # institutional flow). Downgrade to False but still tag session.
+            if is_weekend:
+                self.in_killzone = False
+            else:
+                self.in_killzone = london_kz or ny_kz or asia_kz
 
-            if london_kz:
-                self.current_session = "LONDON"
-            elif ny_kz:
+            # ── Session priority: NY > London > Asia > Weekend > Regular ─
+            # This resolves overlaps (e.g. Asia 0-3 / London 2-5):
+            # during overlap hours, London takes priority (higher impact).
+            if ny_kz and not is_weekend:
                 self.current_session = "NEW_YORK"
-            elif asia_kz:
+            elif london_kz and not is_weekend:
+                self.current_session = "LONDON"
+            elif asia_kz and not is_weekend:
                 self.current_session = "ASIA"
             elif is_weekend:
                 self.current_session = "WEEKEND"
             else:
                 self.current_session = "REGULAR"
 
-            # AMD phase based on killzone timing
-            # ICT AMD: divide each killzone into 3 phases
-            # First third = Accumulation (range building)
-            # Second third = Manipulation (false breakout / sweep)
-            # Final third = Distribution (the real move)
-            if london_kz:
-                kz_start = config.PO3_LONDON_KILLZONE_START
-                kz_end = config.PO3_LONDON_KILLZONE_END
-                kz_len = kz_end - kz_start
-                elapsed = utc_hour - kz_start
-                if elapsed < kz_len / 3:
+            # ── AMD phase (float elapsed — minute-accurate) ───────────
+            # ICT AMD: divide each killzone into 3 phases:
+            #   First third  = Accumulation (range building)
+            #   Second third = Manipulation (false breakout / sweep)
+            #   Final third  = Distribution (the real move)
+            active_kz_start = None
+            active_kz_end   = None
+
+            if self.current_session == "NEW_YORK":
+                active_kz_start = config.PO3_NY_KILLZONE_START
+                active_kz_end   = config.PO3_NY_KILLZONE_END
+            elif self.current_session == "LONDON":
+                active_kz_start = config.PO3_LONDON_KILLZONE_START
+                active_kz_end   = config.PO3_LONDON_KILLZONE_END
+            elif self.current_session == "ASIA":
+                active_kz_start = config.PO3_ASIA_KILLZONE_START
+                active_kz_end   = config.PO3_ASIA_KILLZONE_END
+
+            if active_kz_start is not None:
+                kz_len  = max(active_kz_end - active_kz_start, 0.01)
+                elapsed = utc_hour_f - active_kz_start
+                if elapsed < kz_len / 3.0:
                     self.amd_phase = "ACCUMULATION"
-                elif elapsed < 2 * kz_len / 3:
-                    self.amd_phase = "MANIPULATION"
-                else:
-                    self.amd_phase = "DISTRIBUTION"
-            elif ny_kz:
-                kz_start = config.PO3_NY_KILLZONE_START
-                kz_end = config.PO3_NY_KILLZONE_END
-                kz_len = kz_end - kz_start
-                elapsed = utc_hour - kz_start
-                if elapsed < kz_len / 3:
-                    self.amd_phase = "ACCUMULATION"
-                elif elapsed < 2 * kz_len / 3:
-                    self.amd_phase = "MANIPULATION"
-                else:
-                    self.amd_phase = "DISTRIBUTION"
-            elif asia_kz:
-                kz_start = config.PO3_ASIA_KILLZONE_START
-                kz_end = config.PO3_ASIA_KILLZONE_END
-                kz_len = max(kz_end - kz_start, 1)
-                elapsed = utc_hour - kz_start
-                if elapsed < kz_len / 3:
-                    self.amd_phase = "ACCUMULATION"
-                elif elapsed < 2 * kz_len / 3:
+                elif elapsed < 2.0 * kz_len / 3.0:
                     self.amd_phase = "MANIPULATION"
                 else:
                     self.amd_phase = "DISTRIBUTION"
@@ -2441,10 +2448,14 @@ class AdvancedICTStrategy:
         return True, "L1_OK (range-bound mode)"
 
     def _get_range_bound_entry_threshold(self) -> float:
-        """Return the entry threshold for range-bound trades."""
+        """Return the entry threshold for range-bound trades.
+        Includes regime modifier for consistency with directional thresholds."""
         if self.current_session == "WEEKEND":
-            return getattr(config, "RANGE_BOUND_THRESHOLD_WEEKEND", 80)
-        return getattr(config, "RANGE_BOUND_ENTRY_THRESHOLD", 72)
+            base = getattr(config, "RANGE_BOUND_THRESHOLD_WEEKEND", 80)
+        else:
+            base = getattr(config, "RANGE_BOUND_ENTRY_THRESHOLD", 72)
+        regime_mod = self.regime_engine.state.entry_threshold_modifier
+        return base + regime_mod
 
     def _calculate_range_bound_tp(self, side: str, entry_price: float,
                                    risk: float, current_time: int,
@@ -2461,8 +2472,6 @@ class AdvancedICTStrategy:
         Taking profit at equilibrium is conservative but consistent with
         ICT ranging model (price oscillates around EQ).
         """
-        from structure_engine import _atr as compute_atr
-
         dr = self._get_range_bound_dr()
         if dr is None:
             return None
@@ -3080,16 +3089,20 @@ class AdvancedICTStrategy:
     def _calculate_levels(self, side: str, current_price: float,
                           ctx: TriggerContext,
                           current_time: int = 0,
-                          quiet: bool = False) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+                          quiet: bool = False,
+                          min_rr_override: float = 0.0) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
         Calculate entry, SL, TP from STRUCTURE ONLY. No fallbacks.
         Returns (entry_price, sl_price, tp_price) or (None, None, None).
         Set quiet=True for dry-run calls (e.g. from _build_trade_plan) to suppress warnings.
+        min_rr_override: if > 0, use this instead of config.MIN_RISK_REWARD_RATIO for TP filtering.
         """
         try:
             if current_time <= 0:
                 current_time = int(time.time() * 1000)
             tick   = config.TICK_SIZE
+            # Effective minimum RR for TP candidate filtering
+            min_rr = min_rr_override if min_rr_override > 0 else config.MIN_RISK_REWARD_RATIO
 
             # v11: ATR-based buffer instead of fixed ticks
             c5m_data = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
@@ -3157,7 +3170,7 @@ class AdvancedICTStrategy:
                     if retrace_fvgs:
                         target_fvg = retrace_fvgs[0]  # nearest unfilled bearish FVG
                         rr = (target_fvg.midpoint - entry_price) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = target_fvg.midpoint - buffer
                             logger.info(f"📐 Retracement TP → bearish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
                                         f"(midpoint ${target_fvg.midpoint:,.0f}, RR={rr:.1f})")
@@ -3165,7 +3178,7 @@ class AdvancedICTStrategy:
                             # Try the next FVG if first is too close
                             target_fvg = retrace_fvgs[1]
                             rr = (target_fvg.midpoint - entry_price) / risk if risk > 0 else 0
-                            if rr >= config.MIN_RISK_REWARD_RATIO:
+                            if rr >= min_rr:
                                 tp_price = target_fvg.midpoint - buffer
 
                 # First: nearest EQH (opposing liquidity) — only if no retracement TP set
@@ -3176,7 +3189,7 @@ class AdvancedICTStrategy:
                     if eqh_pools:
                         nearest = min(eqh_pools, key=lambda p: p.price)
                         rr = (nearest.price - entry_price) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = nearest.price - buffer
 
                 # Second: nearest bearish OB (opposing structure)
@@ -3187,13 +3200,13 @@ class AdvancedICTStrategy:
                     if opposing_obs:
                         nearest_ob = min(opposing_obs, key=lambda o: o.low)
                         rr = (nearest_ob.low - entry_price) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = nearest_ob.low - buffer
 
                 # Third: nearest swing high
                 if tp_price is None and ctx.nearest_swing_high is not None:
                     rr = (ctx.nearest_swing_high - entry_price) / risk if risk > 0 else 0
-                    if rr >= config.MIN_RISK_REWARD_RATIO:
+                    if rr >= min_rr:
                         tp_price = ctx.nearest_swing_high - buffer
 
                 # Fourth: DR high if available
@@ -3201,14 +3214,14 @@ class AdvancedICTStrategy:
                     dr = self._ndr.best_dr()
                     if dr is not None and dr.high > entry_price:
                         rr = (dr.high - entry_price) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = dr.high - buffer
 
                 if tp_price is None:
                     # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
                     # If CVD opposes the trade or extension < MIN_RR → reject outright.
                     tp_price = self._calculate_fibonacci_tp(
-                        "long", entry_price, risk, current_time)
+                        "long", entry_price, risk, current_time, min_rr=min_rr)
                     if tp_price is None:
                         if not quiet:
                             logger.warning(
@@ -3275,7 +3288,7 @@ class AdvancedICTStrategy:
                     if retrace_fvgs:
                         target_fvg = retrace_fvgs[0]
                         rr = (entry_price - target_fvg.midpoint) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = target_fvg.midpoint + buffer
                             logger.info(f"📐 Retracement TP → bullish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
                                         f"(midpoint ${target_fvg.midpoint:,.0f}, RR={rr:.1f})")
@@ -3287,7 +3300,7 @@ class AdvancedICTStrategy:
                     if eql_pools:
                         nearest = max(eql_pools, key=lambda p: p.price)
                         rr = (entry_price - nearest.price) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = nearest.price + buffer
 
                 if tp_price is None:
@@ -3297,26 +3310,26 @@ class AdvancedICTStrategy:
                     if opposing_obs:
                         nearest_ob = max(opposing_obs, key=lambda o: o.high)
                         rr = (entry_price - nearest_ob.high) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = nearest_ob.high + buffer
 
                 if tp_price is None and ctx.nearest_swing_low is not None:
                     rr = (entry_price - ctx.nearest_swing_low) / risk if risk > 0 else 0
-                    if rr >= config.MIN_RISK_REWARD_RATIO:
+                    if rr >= min_rr:
                         tp_price = ctx.nearest_swing_low + buffer
 
                 if tp_price is None:
                     dr = self._ndr.best_dr()
                     if dr is not None and dr.low < entry_price:
                         rr = (entry_price - dr.low) / risk if risk > 0 else 0
-                        if rr >= config.MIN_RISK_REWARD_RATIO:
+                        if rr >= min_rr:
                             tp_price = dr.low + buffer
 
                 if tp_price is None:
                     # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
                     # If CVD opposes the trade or extension < MIN_RR → reject outright.
                     tp_price = self._calculate_fibonacci_tp(
-                        "short", entry_price, risk, current_time)
+                        "short", entry_price, risk, current_time, min_rr=min_rr)
                     if tp_price is None:
                         if not quiet:
                             logger.warning(
@@ -3349,6 +3362,7 @@ class AdvancedICTStrategy:
         entry_price  : float,
         risk         : float,
         current_time : int,
+        min_rr       : float = 0.0,
     ) -> Optional[float]:
         """
         Fibonacci extension TP — NO fixed fallback, NO synthetic price.
@@ -3364,11 +3378,13 @@ class AdvancedICTStrategy:
 
         Returns None (→ trade rejected) when:
           • CVD opposes side
-          • Computed extension < MIN_RISK_REWARD_RATIO
+          • Computed extension < minimum RR
           • risk ≤ 0 (invalid setup)
         """
         if risk <= 0:
             return None
+
+        effective_min_rr = min_rr if min_rr > 0 else config.MIN_RISK_REWARD_RATIO
 
         cvd        = self.volume_analyzer.get_cvd_signal()
         cvd_signal = cvd.get("signal", "NEUTRAL")
@@ -3393,10 +3409,10 @@ class AdvancedICTStrategy:
             fib_label = "1.272 (neutral CVD)"
 
         # Must meet minimum RR even after applying the extension
-        if fib_mult < config.MIN_RISK_REWARD_RATIO - 1e-9:
+        if fib_mult < effective_min_rr - 1e-9:
             logger.debug(
                 f"Fibonacci TP rejected: extension {fib_mult:.3f}x "
-                f"< MIN_RR {config.MIN_RISK_REWARD_RATIO}")
+                f"< MIN_RR {effective_min_rr}")
             return None
 
         tick = config.TICK_SIZE
@@ -3439,8 +3455,11 @@ class AdvancedICTStrategy:
                 logger.info("=" * 80)
 
             # quiet=True: _calculate_levels logs nothing; outer gate controls spam
+            is_range_trade = self._range_bound_active
+            rb_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8) if is_range_trade else 0.0
             entry_price, sl_price, tp_price = self._calculate_levels(
-                side, current_price, ctx, current_time=current_time, quiet=True)
+                side, current_price, ctx, current_time=current_time, quiet=True,
+                min_rr_override=rb_rr)
 
             if entry_price is None:
                 rej_key = f"LEVELS_FAIL_{side}"
@@ -3465,7 +3484,6 @@ class AdvancedICTStrategy:
 
             # ── Range-bound mode: override TP if structural TP is outside range ──
             # Also use range-specific RR minimum (lower than directional trades)
-            is_range_trade = self._range_bound_active
             if is_range_trade:
                 rb_min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
                 rb_max_rr = getattr(config, "RANGE_BOUND_MAX_RR", 6.0)
@@ -3953,7 +3971,7 @@ class AdvancedICTStrategy:
 
             # ── Position close check (throttled 5s) ──────────────────────────
             now_sec = current_time / 1000
-            if (now_sec - self._last_pos_check_time) >= 5.0:
+            if (now_sec - self._last_pos_check_time) >= self._POS_CHECK_INTERVAL_SEC:
                 self._check_position_closed(order_manager, current_price, current_time)
                 self._last_pos_check_time = now_sec
 
@@ -5180,6 +5198,7 @@ class AdvancedICTStrategy:
         self.max_favorable_excursion = 0.0
         self.max_adverse_excursion   = 0.0
         self._trade_side             = None
+        self._range_bound_active     = False
 
     def _cancel_pending_sl_tp(self, order_manager) -> None:
         """Cancel pre-placed SL and TP orders when entry is cancelled with no fill.

@@ -165,11 +165,15 @@ HTF_BIAS_THRESHOLD       = 0.55     # 55% needed for directional bias
 # ─────────────────────────────────────────────
 # SESSIONS / KILLZONES (UTC)
 # ─────────────────────────────────────────────
+# NOTE: Asia (0-3) and London (2-5) overlap at 2-3 UTC.
+# During overlap, London takes priority (higher institutional impact).
+# Sessions are float-compared (minute resolution) in strategy.py.
+# Weekend killzones are disabled (thin liquidity → unreliable signals).
 ENABLE_PO3_FILTER          = True
 PO3_LONDON_KILLZONE_START  = 2       # 02:00 UTC (07:30 IST)
 PO3_LONDON_KILLZONE_END    = 5       # 05:00 UTC (10:30 IST)
-PO3_NY_KILLZONE_START      = 12      # 12:00 UTC (07:00 EST / 17:30 IST)
-PO3_NY_KILLZONE_END        = 15      # 15:00 UTC (10:00 EST / 20:30 IST)
+PO3_NY_KILLZONE_START      = 12      # 12:00 UTC (17:30 IST)
+PO3_NY_KILLZONE_END        = 15      # 15:00 UTC (20:30 IST)
 PO3_ASIA_KILLZONE_START    = 0       # 00:00 UTC (05:30 IST)
 PO3_ASIA_KILLZONE_END      = 3       # 03:00 UTC (08:30 IST)
 
@@ -297,7 +301,7 @@ RANGE_BOUND_MIN_RR           = 1.8       # lower RR acceptable (range TP is clos
 RANGE_BOUND_MAX_RR           = 6.0       # cap RR — in range, extreme extensions are unlikely
 
 # ── Entry confluence ──
-RANGE_BOUND_ENTRY_THRESHOLD  = 72        # confluence score needed (higher than killzone, lower than weekend)
+RANGE_BOUND_ENTRY_THRESHOLD  = 72        # confluence score (lower than killzone=75, higher than default)
 RANGE_BOUND_THRESHOLD_WEEKEND = 80       # even stricter on weekends
 
 # ── TP targeting ──

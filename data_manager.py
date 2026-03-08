@@ -9,7 +9,7 @@ import time
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from typing import Optional, Dict, List
 
@@ -70,17 +70,17 @@ class StreamStats:
     def record_orderbook(self) -> None:
         with self._lock:
             self._orderbook_count += 1
-            self._last_update = datetime.utcnow()
+            self._last_update = datetime.now(timezone.utc)
 
     def record_trade(self) -> None:
         with self._lock:
             self._trades_count += 1
-            self._last_update = datetime.utcnow()
+            self._last_update = datetime.now(timezone.utc)
 
     def record_candle(self) -> None:
         with self._lock:
             self._candles_count += 1
-            self._last_update = datetime.utcnow()
+            self._last_update = datetime.now(timezone.utc)
 
     def get_last_update(self) -> Optional[datetime]:
         with self._lock:
@@ -208,12 +208,18 @@ class ICTDataManager:
             logger.info("  - Candles: 1m, 5m, 15m, 1h, 4h, 1d")  # ← UPDATE
             
             # ✅ CRITICAL: REST warmup so cold start has data immediately
+            # Rate-limit between calls to prevent 429 cascades
             logger.info("Warming up candles from REST API...")
             self._warmup_from_klines_1m()
+            time.sleep(3.5)  # respect CoinSwitch 3s hard limit
             self._warmup_from_klines_5m()
+            time.sleep(3.5)
             self._warmup_from_klines_15m()
-            self._warmup_from_klines_1h()  
+            time.sleep(3.5)
+            self._warmup_from_klines_1h()
+            time.sleep(3.5)
             self._warmup_from_klines_4h()
+            time.sleep(3.5)
             self._warmup_from_klines_1d()  
             
             # Mark ready if minimum candles exist
