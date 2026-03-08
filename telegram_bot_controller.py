@@ -27,7 +27,6 @@ import sys
 import traceback
 
 import telegram_config
-from telegram_notifier import _sanitize_html
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +84,6 @@ class TelegramBotController:
 
     def _send_raw(self, text: str, parse_mode: Optional[str] = "HTML") -> bool:
         url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        # Sanitize HTML before sending to prevent "Unsupported start tag" 400 errors.
-        # Dynamic content (regime names, exit reasons, state strings, etc.) may contain
-        # characters that form invalid tags. Mirrors what telegram_notifier already does.
-        if parse_mode == "HTML":
-            text = _sanitize_html(text)
         payload = {
             "chat_id": self.chat_id,
             "text": text,
@@ -98,19 +92,6 @@ class TelegramBotController:
         if parse_mode:
             payload["parse_mode"] = parse_mode
         resp = requests.post(url, json=payload, timeout=10)
-        if resp.status_code == 400 and parse_mode == "HTML":
-            # Last-resort fallback: strip all tags and retry as plain text
-            import re as _re
-            plain = _re.sub(r'<[^>]+>', '', text, flags=_re.DOTALL)
-            plain_payload = {
-                "chat_id": self.chat_id,
-                "text": plain[:4000],
-                "disable_web_page_preview": True,
-            }
-            resp2 = requests.post(url, json=plain_payload, timeout=10)
-            if resp2.status_code == 200:
-                logger.warning("Telegram HTML parse error — sent as plain text fallback")
-                return True
         if resp.status_code != 200:
             logger.error(f"Telegram API error {resp.status_code}: {resp.text[:200]}")
         return resp.status_code == 200
@@ -435,8 +416,10 @@ class TelegramBotController:
                 lines.append(f"  {risk_reason}")
 
             # ── 3. Trade plans (dry-run both sides) ──────────────
+            plans = {}  # store for "What needs to change?" section below
             for side in ["long", "short"]:
                 plan = strat._build_trade_plan(side, price, dm, now_ms)
+                plans[side] = plan
                 status = plan.get("status", "?")
                 label = side.upper()
                 rb_tag = " [RANGE]" if plan.get("range_bound") else ""
@@ -476,29 +459,68 @@ class TelegramBotController:
             lines.append(f"\n{'─' * 25}")
             lines.append(f"<b>What needs to change?</b>")
 
-            if strat.htf_bias == "NEUTRAL" and not rb_active:
-                lines.append("• HTF bias must become directional (BULLISH or BEARISH)")
-                lines.append("  OR ADX must drop below 22 for range-bound mode")
-            elif strat.htf_bias == "NEUTRAL" and rb_active:
-                lines.append("• Price must reach DR extremes (discount for long, premium for short)")
+            added = False
 
-            if not can_trade:
-                lines.append(f"• Risk gate: {risk_reason}")
-
+            # State-level blockers
             if strat.state == "POSITION_ACTIVE":
                 lines.append("• Position already active — managing SL/TP")
+                added = True
             elif strat.state == "ENTRY_PENDING":
                 lines.append("• Entry order pending fill")
+                added = True
 
-            # Nearest entry zones
+            # Risk gate
+            if not can_trade:
+                lines.append(f"• Risk gate blocked: {risk_reason}")
+                added = True
+
+            # Bias/regime context
+            if strat.htf_bias == "NEUTRAL":
+                if rb_active:
+                    lines.append("• Price must reach DR extremes (discount for long, premium for short)")
+                else:
+                    lines.append("• HTF bias must turn directional (BULLISH or BEARISH)")
+                    lines.append(f"  OR ADX must drop below {getattr(cfg, 'RANGE_BOUND_MAX_ADX', 22)} for range-bound mode")
+                added = True
+
+            # Per-side plan blockers — the most useful part
+            for s, plan in plans.items():
+                status = plan.get("status", "")
+                if status == "READY":
+                    continue  # nothing to report for ready side
+                label = s.upper()
+                gate = plan.get("gate_failed") or ""
+                missing = plan.get("missing") or ""
+                score = plan.get("score", 0)
+                threshold = plan.get("threshold", 0)
+
+                if gate or missing:
+                    lines.append(f"\n{label} needs:")
+                    if gate:
+                        lines.append(f"  • {gate}")
+                    if missing:
+                        lines.append(f"  • {missing}")
+                    if score and threshold and score < threshold:
+                        lines.append(f"  • Score {score:.0f}/{threshold:.0f} — needs {threshold - score:.0f} more pts")
+                    added = True
+
+            # Nearest structure zones
             se = getattr(strat, 'structure_engine', None)
             if se:
+                zone_lines = []
                 for s in ["long", "short"]:
                     zone = se.get_best_entry_zone(s, price, now_ms)
                     if zone:
                         z_lo, z_hi, z_type = zone
                         dist = abs(price - (z_lo + z_hi) / 2) / price * 100
-                        lines.append(f"• Nearest {s.upper()} zone: {z_type} ${z_lo:,.0f}–${z_hi:,.0f} ({dist:.2f}% away)")
+                        zone_lines.append(f"• Nearest {s.upper()} zone: {z_type} ${z_lo:,.0f}–${z_hi:,.0f} ({dist:.2f}% away)")
+                if zone_lines:
+                    lines.append("")
+                    lines.extend(zone_lines)
+                    added = True
+
+            if not added:
+                lines.append("• No specific blockers identified — waiting for structure")
 
             self.send_message("\n".join(lines))
             return None
@@ -666,7 +688,7 @@ class TelegramBotController:
             pnl = trade.get("net_pnl", 0)
             rr = trade.get("rr_achieved", 0)
             reason = trade.get("exit_reason", "?")
-            icon = "✅" if pnl >= 0 else "❌"
+            icon = "" if pnl >= 0 else ""
             lines.append(f"  {icon} {side} P&L: ${pnl:+,.2f} ({rr:+.1f}R) [{reason}]")
 
         stats = bot_instance.strategy.get_strategy_stats() if bot_instance.strategy else {}
