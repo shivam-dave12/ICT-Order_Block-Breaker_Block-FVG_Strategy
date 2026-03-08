@@ -90,6 +90,15 @@ class OrderBlock:
             zone_high = self.high - self.size * config.OB_OPTIMAL_ENTRY_MIN
         return zone_low <= price <= zone_high
 
+    def ote_zone(self) -> tuple:
+        """Return (low, high) of the Optimal Trade Entry zone for this OB."""
+        if self.direction == "bullish":
+            return (self.low + self.size * config.OB_OPTIMAL_ENTRY_MIN,
+                    self.low + self.size * config.OB_OPTIMAL_ENTRY_MAX)
+        else:
+            return (self.high - self.size * config.OB_OPTIMAL_ENTRY_MAX,
+                    self.high - self.size * config.OB_OPTIMAL_ENTRY_MIN)
+
     def contains_price(self, price: float) -> bool:
         return self.low <= price <= self.high
 
@@ -414,8 +423,7 @@ class AdvancedICTStrategy:
         self._OUTLOOK_INTERVAL_MS = getattr(config, "OUTLOOK_INTERVAL_SECONDS", 300) * 1000
 
         # ── Spam suppression for repeated identical rejections ────────────
-        self._last_rejection_key: Dict[str, str] = {}   # side → "reason hash"
-        self._last_rejection_time: Dict[str, float] = {}  # side → timestamp
+        self._last_rejection_time: Dict[str, float] = {}  # composite_key → timestamp
         self._REJECTION_LOG_COOLDOWN_MS = 60_000  # only re-log same rejection once per minute
 
         # ── Displacement / retracement tracking ───────────────────────────
@@ -2274,15 +2282,18 @@ class AdvancedICTStrategy:
         Spam suppression: Only log a rejection if it's new or hasn't been
         logged in the last _REJECTION_LOG_COOLDOWN_MS.
         Returns True if the message should be logged.
+
+        Keys on the composite "side|rejection_key" string so that alternating
+        keys (e.g. PASSED_short_85 vs EXEC_short_85) each get their own
+        independent 60-second timer and cannot reset each other's cooldown.
         """
-        prev_key = self._last_rejection_key.get(side)
-        prev_time = self._last_rejection_time.get(side, 0)
+        composite = f"{side}|{rejection_key}"
+        prev_time = self._last_rejection_time.get(composite, 0)
 
-        if prev_key == rejection_key and (now_ms - prev_time) < self._REJECTION_LOG_COOLDOWN_MS:
-            return False  # Same rejection, within cooldown — suppress
+        if (now_ms - prev_time) < self._REJECTION_LOG_COOLDOWN_MS:
+            return False  # Same composite key, within cooldown — suppress
 
-        self._last_rejection_key[side] = rejection_key
-        self._last_rejection_time[side] = now_ms
+        self._last_rejection_time[composite] = now_ms
         return True
 
     # ==================================================================
@@ -3168,18 +3179,19 @@ class AdvancedICTStrategy:
                          and f.fill_percentage < 0.5],
                         key=lambda f: f.bottom)
                     if retrace_fvgs:
-                        target_fvg = retrace_fvgs[0]  # nearest unfilled bearish FVG
-                        rr = (target_fvg.midpoint - entry_price) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = target_fvg.midpoint - buffer
-                            logger.info(f"📐 Retracement TP → bearish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
-                                        f"(midpoint ${target_fvg.midpoint:,.0f}, RR={rr:.1f})")
-                        elif len(retrace_fvgs) > 1:
-                            # Try the next FVG if first is too close
-                            target_fvg = retrace_fvgs[1]
-                            rr = (target_fvg.midpoint - entry_price) / risk if risk > 0 else 0
+                        for target_fvg in retrace_fvgs[:2]:
+                            # FIX: compute RR using the buffered TP, not the raw target.
+                            # Previously: rr = (midpoint - entry) / risk  (ignores buffer deduction)
+                            # Correct:    rr = (midpoint - buffer - entry) / risk
+                            tp_candidate = target_fvg.midpoint - buffer
+                            if tp_candidate <= entry_price:
+                                continue
+                            rr = (tp_candidate - entry_price) / risk if risk > 0 else 0
                             if rr >= min_rr:
-                                tp_price = target_fvg.midpoint - buffer
+                                tp_price = tp_candidate
+                                logger.info(f"📐 Retracement TP → bearish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
+                                            f"(tp=${tp_candidate:,.1f}, RR={rr:.1f})")
+                                break
 
                 # First: nearest EQH (opposing liquidity) — only if no retracement TP set
                 if tp_price is None:
@@ -3188,9 +3200,11 @@ class AdvancedICTStrategy:
                                  and lp.price > entry_price]
                     if eqh_pools:
                         nearest = min(eqh_pools, key=lambda p: p.price)
-                        rr = (nearest.price - entry_price) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = nearest.price - buffer
+                        tp_candidate = nearest.price - buffer
+                        if tp_candidate > entry_price:
+                            rr = (tp_candidate - entry_price) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 # Second: nearest bearish OB (opposing structure)
                 if tp_price is None:
@@ -3199,23 +3213,29 @@ class AdvancedICTStrategy:
                                     and ob.low > entry_price]
                     if opposing_obs:
                         nearest_ob = min(opposing_obs, key=lambda o: o.low)
-                        rr = (nearest_ob.low - entry_price) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = nearest_ob.low - buffer
+                        tp_candidate = nearest_ob.low - buffer
+                        if tp_candidate > entry_price:
+                            rr = (tp_candidate - entry_price) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 # Third: nearest swing high
                 if tp_price is None and ctx.nearest_swing_high is not None:
-                    rr = (ctx.nearest_swing_high - entry_price) / risk if risk > 0 else 0
-                    if rr >= min_rr:
-                        tp_price = ctx.nearest_swing_high - buffer
+                    tp_candidate = ctx.nearest_swing_high - buffer
+                    if tp_candidate > entry_price:
+                        rr = (tp_candidate - entry_price) / risk if risk > 0 else 0
+                        if rr >= min_rr:
+                            tp_price = tp_candidate
 
                 # Fourth: DR high if available
                 if tp_price is None:
                     dr = self._ndr.best_dr()
                     if dr is not None and dr.high > entry_price:
-                        rr = (dr.high - entry_price) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = dr.high - buffer
+                        tp_candidate = dr.high - buffer
+                        if tp_candidate > entry_price:
+                            rr = (tp_candidate - entry_price) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 if tp_price is None:
                     # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
@@ -3286,12 +3306,17 @@ class AdvancedICTStrategy:
                          and f.fill_percentage < 0.5],
                         key=lambda f: f.top, reverse=True)
                     if retrace_fvgs:
-                        target_fvg = retrace_fvgs[0]
-                        rr = (entry_price - target_fvg.midpoint) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = target_fvg.midpoint + buffer
-                            logger.info(f"📐 Retracement TP → bullish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
-                                        f"(midpoint ${target_fvg.midpoint:,.0f}, RR={rr:.1f})")
+                        for target_fvg in retrace_fvgs[:2]:
+                            # FIX: compute RR using the buffered TP, not the raw target.
+                            tp_candidate = target_fvg.midpoint + buffer
+                            if tp_candidate >= entry_price:
+                                continue
+                            rr = (entry_price - tp_candidate) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
+                                logger.info(f"📐 Retracement TP → bullish FVG ${target_fvg.bottom:,.0f}–${target_fvg.top:,.0f} "
+                                            f"(tp=${tp_candidate:,.1f}, RR={rr:.1f})")
+                                break
 
                 if tp_price is None:
                     eql_pools = [lp for lp in self.liquidity_pools
@@ -3299,9 +3324,11 @@ class AdvancedICTStrategy:
                                  and lp.price < entry_price]
                     if eql_pools:
                         nearest = max(eql_pools, key=lambda p: p.price)
-                        rr = (entry_price - nearest.price) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = nearest.price + buffer
+                        tp_candidate = nearest.price + buffer
+                        if tp_candidate < entry_price:
+                            rr = (entry_price - tp_candidate) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 if tp_price is None:
                     opposing_obs = [ob for ob in self.order_blocks_bull
@@ -3309,21 +3336,27 @@ class AdvancedICTStrategy:
                                     and ob.high < entry_price]
                     if opposing_obs:
                         nearest_ob = max(opposing_obs, key=lambda o: o.high)
-                        rr = (entry_price - nearest_ob.high) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = nearest_ob.high + buffer
+                        tp_candidate = nearest_ob.high + buffer
+                        if tp_candidate < entry_price:
+                            rr = (entry_price - tp_candidate) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 if tp_price is None and ctx.nearest_swing_low is not None:
-                    rr = (entry_price - ctx.nearest_swing_low) / risk if risk > 0 else 0
-                    if rr >= min_rr:
-                        tp_price = ctx.nearest_swing_low + buffer
+                    tp_candidate = ctx.nearest_swing_low + buffer
+                    if tp_candidate < entry_price:
+                        rr = (entry_price - tp_candidate) / risk if risk > 0 else 0
+                        if rr >= min_rr:
+                            tp_price = tp_candidate
 
                 if tp_price is None:
                     dr = self._ndr.best_dr()
                     if dr is not None and dr.low < entry_price:
-                        rr = (entry_price - dr.low) / risk if risk > 0 else 0
-                        if rr >= min_rr:
-                            tp_price = dr.low + buffer
+                        tp_candidate = dr.low + buffer
+                        if tp_candidate < entry_price:
+                            rr = (entry_price - tp_candidate) / risk if risk > 0 else 0
+                            if rr >= min_rr:
+                                tp_price = tp_candidate
 
                 if tp_price is None:
                     # NO fixed fallback. Use Fibonacci extension keyed to CVD conviction.
@@ -3505,11 +3538,15 @@ class AdvancedICTStrategy:
                             rr = reward / risk if risk > 0 else 0
 
                 if rr < rb_min_rr - 1e-9:
-                    logger.warning(f"⚠️ [RANGE] RR={rr:.4f} < min {rb_min_rr} — skipping")
+                    rr_key = f"LOW_RR_RANGE_{rr:.2f}"
+                    if self._should_log_rejection(side, rr_key, current_time):
+                        logger.warning(f"⚠️ [RANGE] RR={rr:.4f} < min {rb_min_rr} — skipping")
                     return
             else:
                 if rr < config.MIN_RISK_REWARD_RATIO - 1e-9:
-                    logger.warning(f"⚠️ RR={rr:.4f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
+                    rr_key = f"LOW_RR_{rr:.2f}"
+                    if self._should_log_rejection(side, rr_key, current_time):
+                        logger.warning(f"⚠️ RR={rr:.4f} < min {config.MIN_RISK_REWARD_RATIO} — skipping")
                     return
 
             # Position size
