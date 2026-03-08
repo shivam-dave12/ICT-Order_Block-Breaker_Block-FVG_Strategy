@@ -161,11 +161,26 @@ class ICTBot:
         self.last_health_check_sec = now
 
         stale_sec = float(config.WS_STALE_SECONDS)
-        if self.data_manager.ws.is_healthy(timeout_seconds=int(stale_sec)):
+        ws_healthy = self.data_manager.ws.is_healthy(timeout_seconds=int(stale_sec))
+
+        # Separate check: price may be frozen even when WS appears healthy.
+        # On weekends/low-volume, orderbook pings keep the WS alive but
+        # actual trade/candle price updates stop arriving.
+        price_stale_sec = getattr(config, "PRICE_STALE_SECONDS", 90.0)
+        price_fresh = self.data_manager.is_price_fresh(max_stale_seconds=price_stale_sec)
+
+        if ws_healthy and price_fresh:
             return
 
-        logger.warning("⚠️ WS stale (%ss). Restarting...", stale_sec)
-        send_telegram_message(f"⚠️ WS STALE ({stale_sec}s)\n🔄 Restarting streams...")
+        reason = []
+        if not ws_healthy:
+            reason.append(f"WS silent >{stale_sec:.0f}s")
+        if not price_fresh:
+            reason.append(f"Price frozen >{price_stale_sec:.0f}s")
+        reason_str = " | ".join(reason)
+
+        logger.warning("⚠️ Stream issue: %s — restarting...", reason_str)
+        send_telegram_message(f"⚠️ STREAM ISSUE: {reason_str}\n🔄 Restarting streams...")
 
         ok = self.data_manager.restart_streams()
         if not ok:

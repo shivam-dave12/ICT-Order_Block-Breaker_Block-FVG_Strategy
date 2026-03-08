@@ -251,6 +251,7 @@ EXPANSION_ATR_RATIO      = 1.8
 # ─────────────────────────────────────────────
 WS_STALE_SECONDS                   = 35.0
 HEALTH_CHECK_INTERVAL_SEC          = 12.0
+PRICE_STALE_SECONDS                = 90.0   # restart if no trade/candle price update in 90s
 BALANCE_CACHE_TTL_SEC              = 35.0
 STRUCTURE_UPDATE_INTERVAL_SECONDS  = 30
 ENTRY_EVALUATION_INTERVAL_SECONDS  = 5

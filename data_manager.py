@@ -116,6 +116,7 @@ class ICTDataManager:
 
         # Price / microstructure
         self._last_price: float = 0.0
+        self._last_price_update_time: float = 0.0   # tracks when price last changed from trade/candle
         self._orderbook: Dict = {"bids": [], "asks": []}
         self._recent_trades: deque[Dict] = deque(maxlen=500)
 
@@ -681,6 +682,7 @@ class ICTDataManager:
         if not self._warmup_complete:
             # Before warmup, only update _last_price (for readiness display)
             self._last_price = candle.close
+            self._last_price_update_time = time.time()
             return
 
         is_closed  = data.get('x', False)
@@ -688,6 +690,7 @@ class ICTDataManager:
         forming_ts = self._forming_ts.get(tf_key)    # currently tracked forming start_ts
 
         self._last_price = candle.close
+        self._last_price_update_time = time.time()
 
         if is_closed:
             if forming_ts == start_ts and candle_deque:
@@ -740,6 +743,7 @@ class ICTDataManager:
 
                 if price > 0:
                     self._last_price = price
+                    self._last_price_update_time = time.time()
                     self._recent_trades.append({
                         "price":     price,
                         "quantity":  qty,
@@ -902,6 +906,17 @@ class ICTDataManager:
     def get_last_price(self) -> float:
         with self._lock:
             return self._last_price
+
+    def is_price_fresh(self, max_stale_seconds: float = 90.0) -> bool:
+        """
+        Returns False if _last_price hasn't been updated by a real trade or
+        candle close within max_stale_seconds.  Orderbook pings do NOT count,
+        so this correctly detects weekend / low-volume freezes that fool the
+        normal WS health check.
+        """
+        if self._last_price_update_time == 0:
+            return True   # never received a price yet — don't restart prematurely
+        return (time.time() - self._last_price_update_time) < max_stale_seconds
 
     def get_recent_candles(self, timeframe: str = "1m", limit: int = 50) -> List[Candle]:
         with self._lock:
