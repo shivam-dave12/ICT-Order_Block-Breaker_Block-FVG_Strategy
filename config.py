@@ -226,7 +226,7 @@ TP_STRUCTURE_BUFFER_PCT     = 0.001   # buffer inside structure target
 # ─────────────────────────────────────────────
 TICK_SIZE                = 0.1
 LIMIT_ORDER_OFFSET_TICKS = 5
-ORDER_TIMEOUT_SECONDS    = 300
+ORDER_TIMEOUT_SECONDS    = 600
 MAX_ORDER_RETRIES        = 2
 
 
