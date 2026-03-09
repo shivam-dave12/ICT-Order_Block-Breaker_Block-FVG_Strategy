@@ -129,11 +129,16 @@ class NestedDealingRanges:
 
         # Find the 5 daily candles belonging to the PREVIOUS complete Mon-Fri
         # Filter candles whose timestamp falls in Mon-Fri of the prior week
-        prior_week_num = isoweek[1] - 1
+        # Find the prior complete week number (handles ISO week 52 vs 53 correctly)
+        from datetime import date as _date
+        prior_week_num  = isoweek[1] - 1
         prior_week_year = isoweek[0]
         if prior_week_num == 0:
             prior_week_year -= 1
-            prior_week_num  = 52
+            # ISO week 53 exists in some years — use date arithmetic to verify
+            # The last ISO week of any year is the week containing Dec 28
+            dec28 = _date(prior_week_year, 12, 28)
+            prior_week_num = dec28.isocalendar()[1]   # correct: 52 or 53
 
         week_candles = []
         for c in c1d:

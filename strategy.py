@@ -352,6 +352,7 @@ class AdvancedICTStrategy:
         # HTF Bias
         self.htf_bias             = "NEUTRAL"
         self.htf_bias_strength    = 0.0
+        self.htf_bias_lean        = "BEAR"   # which way NEUTRAL is leaning
         self.htf_bias_components: Dict = {}
         self.daily_bias           = "NEUTRAL"
 
@@ -778,11 +779,18 @@ class AdvancedICTStrategy:
 
             logger.info("=" * 80)
             logger.info(f"🧠 MARKET OUTLOOK @ ${current_price:,.1f}")
-            logger.info(f"   HTF={self.htf_bias} ({self.htf_bias_strength:.0%}) | "
+            # HTF bias — when NEUTRAL, show which way it's leaning
+            htf_str = self.htf_bias
+            if self.htf_bias == "NEUTRAL":
+                lean_arrow = "↑" if self.htf_bias_lean == "BULL" else "↓"
+                htf_str = f"NEUTRAL{lean_arrow}"
+            logger.info(f"   HTF={htf_str} ({self.htf_bias_strength:.0%}) | "
                         f"Daily={self.daily_bias} | "
                         f"Regime={self.regime_engine.state.regime} (ADX {self.regime_engine.state.adx:.1f})")
+            # Session and kill zone are separate concepts — display both
+            kz_name = getattr(self, "_active_kz_name", "—")
             logger.info(f"   Session={self.current_session} | "
-                        f"Killzone={'YES' if self.in_killzone else 'no'} | "
+                        f"KZ={kz_name} | "
                         f"AMD={self.amd_phase}")
 
             # DR levels
@@ -1063,23 +1071,7 @@ class AdvancedICTStrategy:
             else:
                 effective_min_rr = config.MIN_RISK_REWARD_RATIO
 
-            if rr < effective_min_rr - 1e-9:
-                plan["status"] = "LOW_RR"
-            else:
-                # ── Confirmation candle gate (mirrors _evaluate_entries) ───────
-                # Check this here so the outlook status is truthful:
-                # "READY" means the order WILL be placed, not just that structural
-                # gates passed.  Without this, the outlook logs "🎯 READY" while
-                # _evaluate_entries() immediately blocks on the conf-candle gate.
-                c5m = (data_manager.get_candles("5m") or []) if data_manager else []
-                conf_ok, conf_reason = self._check_confirmation_candle(
-                    side, c5m, ctx, current_price)
-                if conf_ok:
-                    plan["status"] = "READY"
-                else:
-                    plan["status"] = "AWAITING_CONF"
-                    plan["gate_failed"] = conf_reason
-
+            plan["status"] = "READY" if rr >= effective_min_rr - 1e-9 else "LOW_RR"
             plan["entry"] = entry_price
             plan["sl"] = sl_price
             plan["tp"] = tp_price
@@ -1130,11 +1122,6 @@ class AdvancedICTStrategy:
             logger.info(f"   🎯 {label}: READY{rb_tag} @ ${plan.get('entry', 0):,.1f} "
                         f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
                         f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
-        elif status == "AWAITING_CONF":
-            logger.info(f"   ⏳ {label}: AWAITING CONF CANDLE{rb_tag} @ ${plan.get('entry', 0):,.1f} "
-                        f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
-                        f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
-            logger.info(f"     💬 {plan.get('gate_failed', 'awaiting rejection candle at zone')}")
         elif "BLOCKED" in status or "BELOW" in status:
             logger.info(f"   ⛔ {label}: {status} — {plan.get('gate_failed', '?')}")
             if plan.get("missing"):
@@ -1715,26 +1702,70 @@ class AdvancedICTStrategy:
             else:
                 bull += 0.05; bear += 0.05; comp["level"] = "N/A"
 
+            # ── 6. Regime ADX / DI Directional Signal (up to 15%) ────────
+            # Wilder's +DI/-DI from 4H candles is the most mechanical
+            # directional measure in technical analysis.  Siloing it from
+            # HTF bias creates deadlocks (TRENDING_BEAR regime + NEUTRAL HTF).
+            # Weight scales with DI spread: 20-pt spread = full 15%.
+            rs = self.regime_engine.state
+            if rs.adx > 0:
+                di_spread = abs(rs.plus_di - rs.minus_di)
+                di_weight = min(di_spread / 20.0, 1.0) * 0.15  # max 15%
+
+                if rs.adx >= config.ADX_TREND_THRESHOLD:
+                    if rs.plus_di > rs.minus_di:
+                        bull += di_weight
+                        comp["regime_di"] = (
+                            f"+DI{rs.plus_di:.1f}>-DI{rs.minus_di:.1f} ADX={rs.adx:.1f} BULL")
+                    else:
+                        bear += di_weight
+                        comp["regime_di"] = (
+                            f"-DI{rs.minus_di:.1f}>+DI{rs.plus_di:.1f} ADX={rs.adx:.1f} BEAR")
+                elif rs.adx >= config.ADX_RANGE_THRESHOLD:
+                    # Transitional — half weight
+                    half = di_weight * 0.5
+                    if rs.plus_di > rs.minus_di:
+                        bull += half
+                        comp["regime_di"] = f"+DI_TRANS ADX={rs.adx:.1f}"
+                    elif rs.minus_di > rs.plus_di:
+                        bear += half
+                        comp["regime_di"] = f"-DI_TRANS ADX={rs.adx:.1f}"
+                    else:
+                        bull += half * 0.5; bear += half * 0.5
+                        comp["regime_di"] = f"DI_FLAT ADX={rs.adx:.1f}"
+                else:
+                    bull += 0.075; bear += 0.075
+                    comp["regime_di"] = f"RANGING ADX={rs.adx:.1f}"
+            else:
+                bull += 0.075; bear += 0.075
+                comp["regime_di"] = "NO_REGIME"
+
             # ── FINAL CALCULATION ──────────────────────────────────────────
             total = bull + bear or 1.0
             bull_pct = bull / total
             bear_pct = bear / total
 
-            # Threshold: 55% for direction (was 60% which was too strict)
-            # With 5 properly weighted components, 55% represents genuine consensus
+            # 55% threshold for directional conviction.
+            # With 6 weighted components (including regime DI), 55% represents
+            # genuine multi-factor consensus.
             THRESH = config.HTF_BIAS_THRESHOLD  # 0.55
 
             if bull_pct >= THRESH:
                 self.htf_bias          = "BULLISH"
                 self.htf_bias_strength = round(bull_pct, 3)
+                self.htf_bias_lean     = "BULL"
             elif bear_pct >= THRESH:
                 self.htf_bias          = "BEARISH"
                 self.htf_bias_strength = round(bear_pct, 3)
+                self.htf_bias_lean     = "BEAR"
             else:
                 self.htf_bias          = "NEUTRAL"
+                # Expose which way NEUTRAL is leaning for display + range-bound mode
                 self.htf_bias_strength = round(max(bull_pct, bear_pct), 3)
+                self.htf_bias_lean     = "BULL" if bull_pct >= bear_pct else "BEAR"
 
             self.htf_bias_components = comp
+
 
         except Exception as e:
             logger.error(f"❌ HTF bias error: {e}", exc_info=True)
@@ -1979,70 +2010,143 @@ class AdvancedICTStrategy:
     # SESSION / KILLZONE
     # ==================================================================
 
+    def _ny_hour_float(self, dt_utc) -> float:
+        """
+        Convert UTC datetime to New York local hour (float, DST-aware).
+        Uses zoneinfo if available (Python 3.9+), falls back to manual DST rule.
+        US DST: 2nd Sunday of March 02:00 ET → 1st Sunday of November 02:00 ET.
+        """
+        try:
+            from zoneinfo import ZoneInfo
+            dt_ny = dt_utc.astimezone(ZoneInfo("America/New_York"))
+            return dt_ny.hour + dt_ny.minute / 60.0
+        except Exception:
+            pass
+
+        # Manual DST fallback: compute UTC offset for Eastern time
+        y, m, d = dt_utc.year, dt_utc.month, dt_utc.day
+        if m < 3 or m > 11:
+            offset = -5  # EST
+        elif 3 < m < 11:
+            offset = -4  # EDT
+        elif m == 3:
+            # DST starts 2nd Sunday of March at 02:00 EST → 07:00 UTC
+            wday_mar1 = datetime(y, 3, 1, tzinfo=timezone.utc).weekday()
+            first_sun = (6 - wday_mar1) % 7 + 1   # 1-based day of first Sunday
+            second_sun = first_sun + 7              # 2nd Sunday
+            dst_start_utc = 7  # 02:00 EST = 07:00 UTC
+            in_dst = (d > second_sun) or (d == second_sun and dt_utc.hour >= dst_start_utc)
+            offset = -4 if in_dst else -5
+        else:  # m == 11
+            # DST ends 1st Sunday of November at 02:00 EDT → 06:00 UTC
+            wday_nov1 = datetime(y, 11, 1, tzinfo=timezone.utc).weekday()
+            first_sun = (6 - wday_nov1) % 7 + 1
+            dst_end_utc = 6   # 02:00 EDT = 06:00 UTC
+            in_dst = (d < first_sun) or (d == first_sun and dt_utc.hour < dst_end_utc)
+            offset = -4 if in_dst else -5
+
+        raw_h = dt_utc.hour + offset + dt_utc.minute / 60.0
+        return raw_h % 24  # wrap negative hours
+
     def _update_session_and_killzone(self, current_time: int) -> None:
+        """
+        Industry-grade ICT session and kill zone detection.
+
+        Kill zones use New York LOCAL time (DST-aware) exactly as ICT defines them.
+        Sessions use UTC to reflect actual institutional market hours.
+
+        ICT Kill Zones (New York time, Power of 3):
+          ASIA_KZ:      20:00–00:00 NY  (pre-Tokyo, Singapore/HK open)
+          LONDON_KZ:    02:00–05:00 NY  (London open accumulation)
+          NY_KZ:        07:00–10:00 NY  (New York open accumulation)
+
+        Sessions (UTC, actual trading hours):
+          ASIA:         00:00–09:00 UTC
+          LONDON:       07:00–17:00 UTC   [overrides ASIA at 07-09 overlap]
+          NEW_YORK:     12:00–21:00 UTC   [overrides LONDON at 12-17 overlap]
+          POST_MARKET:  21:00–00:00 UTC
+
+        AMD Phase (Power of 3) — ONLY valid inside a kill zone.
+        Outside kill zone → IN_SESSION (if within session) or OFF_HOURS.
+        """
         try:
             dt = datetime.fromtimestamp(current_time / 1000, tz=timezone.utc)
-            weekday = dt.weekday()                    # 0=Mon … 6=Sun
-            # ── Float hour for minute-resolution killzone & AMD ───────
-            utc_hour_f = dt.hour + dt.minute / 60.0   # e.g. 12:45 → 12.75
+            weekday   = dt.weekday()    # 0=Mon … 6=Sun
+            is_weekend = weekday >= 5
 
-            is_weekend = weekday >= 5  # Saturday, Sunday
+            utc_h = dt.hour + dt.minute / 60.0
+            ny_h  = self._ny_hour_float(dt)
 
-            # ── Killzone detection (float comparison, minute-accurate) ─
-            london_kz = config.PO3_LONDON_KILLZONE_START <= utc_hour_f < config.PO3_LONDON_KILLZONE_END
-            ny_kz     = config.PO3_NY_KILLZONE_START     <= utc_hour_f < config.PO3_NY_KILLZONE_END
-            asia_kz   = config.PO3_ASIA_KILLZONE_START   <= utc_hour_f < config.PO3_ASIA_KILLZONE_END
+            # ── Kill Zone detection (New York local time) ────────────────
+            # Asia KZ spans midnight: check 20-24 and 0-0 (i.e. h>=20 or h<0)
+            asia_kz   = not is_weekend and (
+                ny_h >= float(config.KZ_ASIA_NY_START) or ny_h < 0.0
+            )
+            london_kz = not is_weekend and (
+                float(config.KZ_LONDON_NY_START) <= ny_h < float(config.KZ_LONDON_NY_END)
+            )
+            ny_kz     = not is_weekend and (
+                float(config.KZ_NY_NY_START) <= ny_h < float(config.KZ_NY_NY_END)
+            )
 
-            # ── Weekend: killzones are unreliable (thin liquidity, no ──
-            # institutional flow). Downgrade to False but still tag session.
-            if is_weekend:
-                self.in_killzone = False
+            self.in_killzone = asia_kz or london_kz or ny_kz
+
+            # Track which kill zone is active (for AMD + display)
+            if ny_kz:
+                active_kz = "NY_KZ"
+                kz_start, kz_end = float(config.KZ_NY_NY_START), float(config.KZ_NY_NY_END)
+                elapsed = ny_h - kz_start
+            elif london_kz:
+                active_kz = "LONDON_KZ"
+                kz_start, kz_end = float(config.KZ_LONDON_NY_START), float(config.KZ_LONDON_NY_END)
+                elapsed = ny_h - kz_start
+            elif asia_kz:
+                active_kz = "ASIA_KZ"
+                kz_start, kz_end = float(config.KZ_ASIA_NY_START), 24.0
+                elapsed = ny_h - kz_start if ny_h >= kz_start else ny_h + (24.0 - kz_start)
             else:
-                self.in_killzone = london_kz or ny_kz or asia_kz
+                active_kz = None
+                elapsed   = 0.0
+                kz_start = kz_end = 0.0
 
-            # ── Session priority: NY > London > Asia > Weekend > Regular ─
-            # This resolves overlaps (e.g. Asia 0-3 / London 2-5):
-            # during overlap hours, London takes priority (higher impact).
-            if ny_kz and not is_weekend:
-                self.current_session = "NEW_YORK"
-            elif london_kz and not is_weekend:
-                self.current_session = "LONDON"
-            elif asia_kz and not is_weekend:
-                self.current_session = "ASIA"
-            elif is_weekend:
+            self._active_kz_name: str = active_kz or "—"   # exposed for display
+
+            # ── Session label (UTC — actual institutional hours) ─────────
+            in_asia   = float(config.SESSION_ASIA_UTC_START)    <= utc_h < float(config.SESSION_ASIA_UTC_END)
+            in_london = float(config.SESSION_LONDON_UTC_START)  <= utc_h < float(config.SESSION_LONDON_UTC_END)
+            in_ny     = float(config.SESSION_NY_UTC_START)      <= utc_h < float(config.SESSION_NY_UTC_END)
+
+            if is_weekend:
                 self.current_session = "WEEKEND"
+            elif in_ny:
+                # NY overrides London during 12–17 overlap (most liquid period)
+                self.current_session = "NEW_YORK"
+            elif in_london:
+                self.current_session = "LONDON"
+            elif in_asia:
+                self.current_session = "ASIA"
+            elif utc_h >= 21.0 or utc_h < float(config.SESSION_ASIA_UTC_START):
+                self.current_session = "POST_MARKET"
             else:
                 self.current_session = "REGULAR"
 
-            # ── AMD phase (float elapsed — minute-accurate) ───────────
-            # ICT AMD: divide each killzone into 3 phases:
-            #   First third  = Accumulation (range building)
-            #   Second third = Manipulation (false breakout / sweep)
-            #   Final third  = Distribution (the real move)
-            active_kz_start = None
-            active_kz_end   = None
-
-            if self.current_session == "NEW_YORK":
-                active_kz_start = config.PO3_NY_KILLZONE_START
-                active_kz_end   = config.PO3_NY_KILLZONE_END
-            elif self.current_session == "LONDON":
-                active_kz_start = config.PO3_LONDON_KILLZONE_START
-                active_kz_end   = config.PO3_LONDON_KILLZONE_END
-            elif self.current_session == "ASIA":
-                active_kz_start = config.PO3_ASIA_KILLZONE_START
-                active_kz_end   = config.PO3_ASIA_KILLZONE_END
-
-            if active_kz_start is not None:
-                kz_len  = max(active_kz_end - active_kz_start, 0.01)
-                elapsed = utc_hour_f - active_kz_start
-                if elapsed < kz_len / 3.0:
+            # ── AMD Phase (ICT Power of 3) ───────────────────────────────
+            # Only meaningful inside an active kill zone.
+            if is_weekend:
+                self.amd_phase = "WEEKEND"
+            elif active_kz is not None:
+                kz_len = max(kz_end - kz_start, 0.01)
+                frac   = elapsed / kz_len
+                if frac < 1.0 / 3.0:
                     self.amd_phase = "ACCUMULATION"
-                elif elapsed < 2.0 * kz_len / 3.0:
+                elif frac < 2.0 / 3.0:
                     self.amd_phase = "MANIPULATION"
                 else:
                     self.amd_phase = "DISTRIBUTION"
+            elif in_ny or in_london or in_asia:
+                self.amd_phase = "IN_SESSION"
             else:
-                self.amd_phase = "REGULAR"
+                self.amd_phase = "OFF_HOURS"
 
         except Exception as e:
             logger.error(f"Session update error: {e}", exc_info=True)
@@ -3047,8 +3151,9 @@ class AdvancedICTStrategy:
 
             # ── 9. Killzone bonus (0-8) ────────────────────────────────
             if self.in_killzone:
+                kz_label = getattr(self, "_active_kz_name", self.current_session)
                 score += 8.0
-                reasons.append(f"Killzone {self.current_session} +8")
+                reasons.append(f"Killzone {kz_label} +8")
 
             # ── 10. DR Zone (0-12 / -18 penalty) ──────────────────────
             dr = self._ndr.best_dr()
