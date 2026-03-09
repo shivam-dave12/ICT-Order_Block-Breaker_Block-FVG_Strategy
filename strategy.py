@@ -1063,7 +1063,23 @@ class AdvancedICTStrategy:
             else:
                 effective_min_rr = config.MIN_RISK_REWARD_RATIO
 
-            plan["status"] = "READY" if rr >= effective_min_rr - 1e-9 else "LOW_RR"
+            if rr < effective_min_rr - 1e-9:
+                plan["status"] = "LOW_RR"
+            else:
+                # ── Confirmation candle gate (mirrors _evaluate_entries) ───────
+                # Check this here so the outlook status is truthful:
+                # "READY" means the order WILL be placed, not just that structural
+                # gates passed.  Without this, the outlook logs "🎯 READY" while
+                # _evaluate_entries() immediately blocks on the conf-candle gate.
+                c5m = (data_manager.get_candles("5m") or []) if data_manager else []
+                conf_ok, conf_reason = self._check_confirmation_candle(
+                    side, c5m, ctx, current_price)
+                if conf_ok:
+                    plan["status"] = "READY"
+                else:
+                    plan["status"] = "AWAITING_CONF"
+                    plan["gate_failed"] = conf_reason
+
             plan["entry"] = entry_price
             plan["sl"] = sl_price
             plan["tp"] = tp_price
@@ -1114,6 +1130,11 @@ class AdvancedICTStrategy:
             logger.info(f"   🎯 {label}: READY{rb_tag} @ ${plan.get('entry', 0):,.1f} "
                         f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
                         f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
+        elif status == "AWAITING_CONF":
+            logger.info(f"   ⏳ {label}: AWAITING CONF CANDLE{rb_tag} @ ${plan.get('entry', 0):,.1f} "
+                        f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
+                        f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
+            logger.info(f"     💬 {plan.get('gate_failed', 'awaiting rejection candle at zone')}")
         elif "BLOCKED" in status or "BELOW" in status:
             logger.info(f"   ⛔ {label}: {status} — {plan.get('gate_failed', '?')}")
             if plan.get("missing"):
