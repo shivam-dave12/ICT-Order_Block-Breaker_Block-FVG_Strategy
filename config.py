@@ -163,19 +163,40 @@ HTF_BIAS_THRESHOLD       = 0.55     # 55% needed for directional bias
 
 
 # ─────────────────────────────────────────────
-# SESSIONS / KILLZONES (UTC)
+# SESSIONS / KILLZONES
 # ─────────────────────────────────────────────
-# NOTE: Asia (0-3) and London (2-5) overlap at 2-3 UTC.
-# During overlap, London takes priority (higher institutional impact).
-# Sessions are float-compared (minute resolution) in strategy.py.
-# Weekend killzones are disabled (thin liquidity → unreliable signals).
-ENABLE_PO3_FILTER          = True
-PO3_LONDON_KILLZONE_START  = 2       # 02:00 UTC (07:30 IST)
-PO3_LONDON_KILLZONE_END    = 5       # 05:00 UTC (10:30 IST)
-PO3_NY_KILLZONE_START      = 12      # 12:00 UTC (17:30 IST)
-PO3_NY_KILLZONE_END        = 15      # 15:00 UTC (20:30 IST)
-PO3_ASIA_KILLZONE_START    = 0       # 00:00 UTC (05:30 IST)
-PO3_ASIA_KILLZONE_END      = 3       # 03:00 UTC (08:30 IST)
+# Kill zones are expressed in NEW YORK LOCAL TIME (DST-aware) per ICT methodology.
+# DST conversion is handled automatically inside strategy.py.
+# Sessions are expressed in UTC (actual exchange/market hours).
+#
+# ICT Kill Zones (New York / Eastern time):
+#   Asia KZ:    20:00–00:00 ET  (8 PM–midnight; pre-Tokyo, Singapore)
+#   London KZ:  02:00–05:00 ET  (2 AM–5 AM; London open Power of 3)
+#   NY Open KZ: 07:00–10:00 ET  (7 AM–10 AM; New York open Power of 3)
+#
+# Sessions (UTC, actual institutional market hours):
+#   ASIA:         00:00–09:00 UTC  (Tokyo 09:00 JST = 00:00 UTC)
+#   LONDON:       07:00–17:00 UTC  (LSE 08:00 BST, overrides ASIA from 07:00)
+#   NEW_YORK:     12:00–21:00 UTC  (NYSE/NASDAQ 09:30 EST/EDT, overrides LONDON from 12:00)
+#   POST_MARKET:  21:00–00:00 UTC
+
+ENABLE_PO3_FILTER = True
+
+# Kill zones in New York local time (DST-aware — strategy.py converts via zoneinfo/fallback)
+KZ_ASIA_NY_START    = 20   # 8:00 PM New York time
+KZ_ASIA_NY_END      = 24   # midnight New York (0:00 wrap handled in code)
+KZ_LONDON_NY_START  = 2    # 2:00 AM New York time
+KZ_LONDON_NY_END    = 5    # 5:00 AM New York time
+KZ_NY_NY_START      = 7    # 7:00 AM New York time
+KZ_NY_NY_END        = 10   # 10:00 AM New York time
+
+# Sessions in UTC (strategy.py uses these for session label)
+SESSION_ASIA_UTC_START    = 0
+SESSION_ASIA_UTC_END      = 9
+SESSION_LONDON_UTC_START  = 7
+SESSION_LONDON_UTC_END    = 17
+SESSION_NY_UTC_START      = 12
+SESSION_NY_UTC_END        = 21
 
 
 # ─────────────────────────────────────────────
