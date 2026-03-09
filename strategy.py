@@ -1071,7 +1071,23 @@ class AdvancedICTStrategy:
             else:
                 effective_min_rr = config.MIN_RISK_REWARD_RATIO
 
-            plan["status"] = "READY" if rr >= effective_min_rr - 1e-9 else "LOW_RR"
+            if rr < effective_min_rr - 1e-9:
+                plan["status"] = "LOW_RR"
+                plan["gate_failed"] = f"RR {rr:.1f}x (min {effective_min_rr:.1f}x)"
+            else:
+                # ── Confirmation candle gate (dry-run) ────────────────────
+                # Must mirror _evaluate_entry or the outlook will show READY
+                # on trades that will be blocked at execution.
+                _dm = self._data_manager if self._data_manager is not None else data_manager
+                c5m = (_dm.get_candles("5m") or []) if _dm else []
+                conf_ok, conf_reason = self._check_confirmation_candle(
+                    side, c5m, ctx, current_price)
+                if conf_ok:
+                    plan["status"] = "READY"
+                else:
+                    plan["status"] = "AWAITING_CONF"
+                    plan["gate_failed"] = conf_reason
+
             plan["entry"] = entry_price
             plan["sl"] = sl_price
             plan["tp"] = tp_price
@@ -1122,6 +1138,11 @@ class AdvancedICTStrategy:
             logger.info(f"   🎯 {label}: READY{rb_tag} @ ${plan.get('entry', 0):,.1f} "
                         f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
                         f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
+        elif status == "AWAITING_CONF":
+            logger.info(f"   ⏳ {label}: AWAITING_CONF{rb_tag} @ ${plan.get('entry', 0):,.1f} "
+                        f"SL=${plan.get('sl', 0):,.1f} TP=${plan.get('tp', 0):,.1f} "
+                        f"RR={plan.get('rr', 0):.1f} Score={plan.get('score', 0):.0f}")
+            logger.info(f"     💬 {plan.get('gate_failed', 'awaiting rejection candle at zone')}")
         elif "BLOCKED" in status or "BELOW" in status:
             logger.info(f"   ⛔ {label}: {status} — {plan.get('gate_failed', '?')}")
             if plan.get("missing"):
@@ -1852,14 +1873,42 @@ class AdvancedICTStrategy:
                 bull_score += 0.15; bear_score += 0.15
 
             # ── 3. Session Price Direction (20%) ──────────────────────────
-            # Use recent 5m candles to determine intraday direction
-            if len(candles_5m) >= 12:
-                # Compare current price vs price ~1 hour ago (12 × 5m candles)
-                session_open = float(candles_5m[-12]['o'])
-                if current_price > session_open * 1.001:
-                    bull_score += 0.20
-                elif current_price < session_open * 0.999:
-                    bear_score += 0.20
+            # Anchor to the actual session open candle (the first 5m bar whose
+            # timestamp falls at or after the current session's UTC open hour).
+            # Falls back to 1-hour lookback if session anchor not found.
+            if len(candles_5m) >= 3:
+                session_open: Optional[float] = None
+                try:
+                    session_h_utc = {
+                        "NEW_YORK":   config.SESSION_NY_UTC_START,
+                        "LONDON":     config.SESSION_LONDON_UTC_START,
+                        "ASIA":       config.SESSION_ASIA_UTC_START,
+                    }.get(self.current_session)
+
+                    if session_h_utc is not None:
+                        from datetime import datetime, timezone as _tz
+                        for c in candles_5m:
+                            ct = int(c.get('t', 0))
+                            if ct <= 0:
+                                continue
+                            c_dt = datetime.fromtimestamp(ct / 1000, tz=_tz.utc)
+                            if c_dt.hour == session_h_utc and c_dt.minute < 10:
+                                session_open = float(c['o'])
+                                # Take the most recent match (last candle at open hour)
+                except Exception:
+                    pass
+
+                # Fallback: price 1 hour ago (12 × 5m)
+                if session_open is None and len(candles_5m) >= 12:
+                    session_open = float(candles_5m[-12]['o'])
+
+                if session_open and session_open > 0:
+                    if current_price > session_open * 1.001:
+                        bull_score += 0.20
+                    elif current_price < session_open * 0.999:
+                        bear_score += 0.20
+                    else:
+                        bull_score += 0.10; bear_score += 0.10
                 else:
                     bull_score += 0.10; bear_score += 0.10
             else:
@@ -2080,7 +2129,7 @@ class AdvancedICTStrategy:
             # ── Kill Zone detection (New York local time) ────────────────
             # Asia KZ spans midnight: check 20-24 and 0-0 (i.e. h>=20 or h<0)
             asia_kz   = not is_weekend and (
-                ny_h >= float(config.KZ_ASIA_NY_START) or ny_h < 0.0
+                ny_h >= float(config.KZ_ASIA_NY_START)   # 20:00–00:00 NY (midnight = end of KZ)
             )
             london_kz = not is_weekend and (
                 float(config.KZ_LONDON_NY_START) <= ny_h < float(config.KZ_LONDON_NY_END)
@@ -5143,11 +5192,16 @@ class AdvancedICTStrategy:
 
             won = price_delta > 0
 
-            # ── Determine close reason from price proximity ───────────
-            # (proximity test, not PnL sign — breakeven SL is still a SL_HIT)
-            if sl and tp:
-                dist_to_sl = abs(close_price - sl)
-                dist_to_tp = abs(close_price - tp)
+            # ── Determine close reason ────────────────────────────────
+            # Use CURRENT sl/tp (not initial) — after trailing, initial_sl
+            # may be far from the actual fired price, causing SL_HIT to be
+            # misidentified as TP_HIT or vice versa.
+            sl_for_reason = self.current_sl_price or self.initial_sl_price or 0.0
+            tp_for_reason = self.current_tp_price or self.initial_tp_price or 0.0
+
+            if sl_for_reason and tp_for_reason:
+                dist_to_sl = abs(close_price - sl_for_reason)
+                dist_to_tp = abs(close_price - tp_for_reason)
                 reason = "SL_HIT" if dist_to_sl <= dist_to_tp else "TP_HIT"
             elif won:
                 reason = "TP_HIT"
