@@ -629,39 +629,23 @@ class ICTDataManager:
             logger.error(f"Error in 1d warmup: {e}", exc_info=True)
 
     def _check_minimum_data(self) -> bool:
-        """
-        Check if we have minimum candles to start trading.
-
-        Minimums are determined by the most data-hungry algorithm per timeframe:
-          1m  / 5m  / 15m : structure detection needs 50+ bars
-          1h              : daily bias 1H structure uses last 20 confirmed MSS
-          4h              : RegimeEngine Wilder's ADX needs 2*period+1 = 29 bars
-          1d              : weekly DR detection needs at least 7 daily bars
-        """
-        min_1m  = getattr(config, "MIN_CANDLES_1M",  100)
-        min_5m  = getattr(config, "MIN_CANDLES_5M",  100)
-        min_15m = getattr(config, "MIN_CANDLES_15M", 100)
-        min_1h  = getattr(config, "MIN_CANDLES_1H",   20)
-        min_4h  = max(getattr(config, "MIN_CANDLES_4H", 40), 29)  # RegimeEngine ADX needs 29
-        min_1d  = getattr(config, "MIN_CANDLES_1D",    7)
-
-        counts = {
-            "1m":  len(self._candles_1m),
-            "5m":  len(self._candles_5m),
-            "15m": len(self._candles_15m),
-            "1h":  len(self._candles_1h),
-            "4h":  len(self._candles_4h),
-            "1d":  len(self._candles_1d),
-        }
-        mins = {"1m": min_1m, "5m": min_5m, "15m": min_15m,
-                "1h": min_1h, "4h": min_4h, "1d": min_1d}
-
-        missing = [f"{tf}({counts[tf]}<{mins[tf]})"
-                   for tf in mins if counts[tf] < mins[tf]]
-        if missing:
-            logger.debug(f"DataManager not ready — insufficient candles: {', '.join(missing)}")
-            return False
-        return True
+        """Check if we have minimum candles to start trading"""
+        min_1m = 50
+        min_5m = 50
+        min_15m = 30
+        min_1h = 20 
+        min_4h = 10
+        min_1d = 7 
+        
+        has_min = (
+            len(self._candles_1m) >= min_1m and
+            len(self._candles_5m) >= min_5m and
+            len(self._candles_15m) >= min_15m and
+            len(self._candles_1h) >= min_1h and
+            len(self._candles_4h) >= min_4h and
+            len(self._candles_1d) >= min_1d 
+        )
+        return has_min
 
     def wait_until_ready(self, timeout_sec: float = 120.0) -> bool:
         """Block until data manager is ready or timeout"""
