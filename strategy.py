@@ -239,12 +239,19 @@ class VolumeProfileAnalyzer:
             try:
                 o = float(candle['o'])
                 c = float(candle['c'])
+                h = float(candle['h'])
+                l = float(candle['l'])
                 v = float(candle.get('v', 0))
                 ts = candle.get('t', int(time.time() * 1000))
                 if v <= 0:
                     return
-                body_ratio = (c - o) / max(abs(c - o) + 1e-9, 1e-9)
-                buy_vol  = v * (0.5 + 0.5 * body_ratio)
+                rng = h - l
+                # Industry-standard CVD delta: buy_vol = v × (close - low) / (high - low)
+                # This weights volume by where the close sits in the bar's range,
+                # giving more buy pressure to closes near the high and vice versa.
+                # Guard against zero-range doji candles (use 0.5 split).
+                buy_ratio = (c - l) / rng if rng > 1e-9 else 0.5
+                buy_vol  = v * buy_ratio
                 sell_vol = v - buy_vol
                 self.cvd_history.append({
                     'delta': buy_vol - sell_vol,
@@ -419,6 +426,10 @@ class AdvancedICTStrategy:
         self._last_sl_health_check     = 0
         self._last_pos_check_time      = 0      # throttle _check_position_closed
         self._POS_CHECK_INTERVAL_SEC   = 5.0    # check every 5s, not every 250ms tick
+
+        # SL/TP health check consecutive-unknown counters (init here, not via hasattr)
+        self._sl_unknown_count: int    = 0
+        self._tp_unknown_count: int    = 0
 
         # Outlook interval (5 minutes)
         self._OUTLOOK_INTERVAL_MS = getattr(config, "OUTLOOK_INTERVAL_SECONDS", 300) * 1000
@@ -2460,6 +2471,9 @@ class AdvancedICTStrategy:
         Keys on the composite "side|rejection_key" string so that alternating
         keys (e.g. PASSED_short_85 vs EXEC_short_85) each get their own
         independent 60-second timer and cannot reset each other's cooldown.
+
+        Memory leak guard: evict entries older than 10 minutes when dict
+        exceeds 500 entries to prevent unbounded growth during long sessions.
         """
         composite = f"{side}|{rejection_key}"
         prev_time = self._last_rejection_time.get(composite, 0)
@@ -2468,6 +2482,14 @@ class AdvancedICTStrategy:
             return False  # Same composite key, within cooldown — suppress
 
         self._last_rejection_time[composite] = now_ms
+
+        # Evict stale entries when dict grows large (prevents multi-day memory leak)
+        if len(self._last_rejection_time) > 500:
+            cutoff = now_ms - 10 * 60_000  # evict anything older than 10 minutes
+            stale = [k for k, v in self._last_rejection_time.items() if v < cutoff]
+            for k in stale:
+                del self._last_rejection_time[k]
+
         return True
 
     # ==================================================================
@@ -2663,7 +2685,13 @@ class AdvancedICTStrategy:
 
         tick = config.TICK_SIZE
         c5m_data = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
-        atr = compute_atr(c5m_data, config.SL_ATR_PERIOD) if len(c5m_data) >= config.SL_ATR_PERIOD + 1 else entry_price * 0.002
+        if len(c5m_data) < config.SL_ATR_PERIOD + 1:
+            logger.debug("_calculate_range_bound_tp: insufficient candles for ATR — returning None")
+            return None
+        atr = compute_atr(c5m_data, config.SL_ATR_PERIOD)
+        if atr <= 0:
+            logger.debug("_calculate_range_bound_tp: ATR=0 — returning None")
+            return None
         buffer = atr * config.SL_ATR_BUFFER_MULT
 
         min_rr = getattr(config, "RANGE_BOUND_MIN_RR", 1.8)
@@ -2842,6 +2870,7 @@ class AdvancedICTStrategy:
                     return False, f"Retracement long blocked — weekly extreme premium ({wz:.0%})"
                 if side == "short" and wz < 0.20:
                     return False, f"Retracement short blocked — weekly extreme discount ({wz:.0%})"
+            self._range_bound_active = False  # retracement is NOT range-bound mode
             return True, "L1_OK (retracement after displacement)"
 
         # ── RANGE-BOUND MODE BYPASS ────────────────────────────────────────
@@ -3680,11 +3709,11 @@ class AdvancedICTStrategy:
             if side == "long":
                 if sl_price >= entry_price or tp_price <= entry_price:
                     logger.error(f"Invalid LONG levels: entry={entry_price} SL={sl_price} TP={tp_price}")
-                    return None, None, None
+                    return
             elif side == "short":
                 if sl_price <= entry_price or tp_price >= entry_price:
                     logger.error(f"Invalid SHORT levels: entry={entry_price} SL={sl_price} TP={tp_price}")
-                    return None, None, None
+                    return
 
             risk   = abs(entry_price - sl_price)
             reward = abs(tp_price - entry_price)
@@ -3756,7 +3785,7 @@ class AdvancedICTStrategy:
                 logger.error(f"❌ Entry order failed: {result}")
                 return
 
-            order_id = result.get("data", {}).get("order_id") or result.get("order_id")
+            order_id = result.get("order_id")
             if not order_id:
                 logger.error("❌ No order_id in response")
                 return
@@ -3782,8 +3811,7 @@ class AdvancedICTStrategy:
             sl_result = order_manager.place_stop_loss(
                 side=sl_side, quantity=position_size, trigger_price=sl_price)
             if sl_result and "error" not in sl_result:
-                self.sl_order_id = (sl_result.get("data", {}).get("order_id")
-                                    or sl_result.get("order_id"))
+                self.sl_order_id = sl_result.get("order_id")
                 logger.info(f"✅ SL pre-placed: {self.sl_order_id} @ ${sl_price:,.2f}")
             else:
                 logger.error(f"❌ SL pre-placement failed: {sl_result}")
@@ -3794,8 +3822,7 @@ class AdvancedICTStrategy:
             tp_result = order_manager.place_take_profit(
                 side=sl_side, quantity=position_size, trigger_price=tp_price)
             if tp_result and "error" not in tp_result:
-                self.tp_order_id = (tp_result.get("data", {}).get("order_id")
-                                    or tp_result.get("order_id"))
+                self.tp_order_id = tp_result.get("order_id")
                 logger.info(f"✅ TP pre-placed: {self.tp_order_id} @ ${tp_price:,.2f}")
             else:
                 logger.error(f"❌ TP pre-placement failed: {tp_result}")
@@ -4086,14 +4113,15 @@ class AdvancedICTStrategy:
 
             time.sleep(2.0)
             
-            # Place SL — always fresh (pre-placement removed)
+            # Place SL — skip if pre-placement already succeeded (sl_order_id is set).
+            # Re-place if pre-placement failed or if we had to cancel wrong-qty orders above.
             if not self.sl_order_id:
                 GlobalRateLimiter.wait()
                 sl_result = order_manager.place_stop_loss(
                     side=sl_side, quantity=actual_qty,
                     trigger_price=self.current_sl_price)
                 if sl_result and "error" not in sl_result:
-                    self.sl_order_id = sl_result.get("data", {}).get("order_id") or sl_result.get("order_id")
+                    self.sl_order_id = sl_result.get("order_id")
                     logger.info(f"✅ SL placed on fill: {self.sl_order_id} @ ${self.current_sl_price:,.2f} qty={actual_qty}")
                 else:
                     logger.error(f"❌ SL placement failed on fill: {sl_result}")
@@ -4108,7 +4136,7 @@ class AdvancedICTStrategy:
                     side=sl_side, quantity=actual_qty,
                     trigger_price=self.current_tp_price)
                 if tp_result and "error" not in tp_result:
-                    self.tp_order_id = tp_result.get("data", {}).get("order_id") or tp_result.get("order_id")
+                    self.tp_order_id = tp_result.get("order_id")
                     logger.info(f"✅ TP placed on fill: {self.tp_order_id} @ ${self.current_tp_price:,.2f} qty={actual_qty}")
                 else:
                     logger.error(f"❌ TP placement failed on fill: {tp_result} — launching TP Guardian")
@@ -4146,9 +4174,9 @@ class AdvancedICTStrategy:
                     "forcing reset to READY. Check exchange for orphaned position!"
                 )
                 send_telegram_message(
-                    "🚨 <b>ENTRY FILL ERROR — manual check required</b>\\n"
-                    "Exception in fill handler — state reset to READY.\\n"
-                    f"<code>{str(e)[:200]}</code>\\n"
+                    "🚨 <b>ENTRY FILL ERROR — manual check required</b>\n"
+                    "Exception in fill handler — state reset to READY.\n"
+                    f"<code>{str(e)[:200]}</code>\n"
                     "Verify exchange for orphaned position/orders."
                 )
                 self._reset_position_state()
@@ -4320,7 +4348,7 @@ class AdvancedICTStrategy:
             if result and "error" not in result:
                 try:
                     fill = order_manager.get_fill_details(
-                        result.get("data", {}).get("order_id") or result.get("order_id", "")
+                        result.get("order_id", "")
                     )
                     if fill and fill.get("fill_price"):
                         actual_close_price = fill["fill_price"]
@@ -4331,16 +4359,16 @@ class AdvancedICTStrategy:
                     f"@ ${actual_close_price:,.2f}"
                 )
                 send_telegram_message(
-                    f"🔴 *CHoCH Exit — {side.upper()}*\n"
+                    f"🔴 <b>CHoCH Exit — {side.upper()}</b>\n"
                     f"Structure reversed. Full position closed at market.\n"
-                    f"Close price: `${actual_close_price:,.2f}`\n"
-                    f"Qty: `{qty}`"
+                    f"Close price: <code>${actual_close_price:,.2f}</code>\n"
+                    f"Qty: <code>{qty}</code>"
                 )
             else:
                 logger.critical(f"❌ CHoCH market close FAILED: {result}")
                 send_telegram_message(
-                    f"🚨 *CRITICAL — CHoCH close FAILED* ({side.upper()})\n"
-                    f"Manual intervention required!\n`{result}`"
+                    f"🚨 <b>CRITICAL — CHoCH close FAILED</b> ({side.upper()})\n"
+                    f"Manual intervention required!\n<code>{result}</code>"
                 )
 
             self._on_position_closed(side, actual_close_price, current_time)
@@ -4361,9 +4389,9 @@ class AdvancedICTStrategy:
                 f"BOS/CHoCH to clear"
             )
             send_telegram_message(
-                f"⛔ <b>Post-CHoCH block: {side.upper()}</b>\\n"
+                f"⛔ <b>Post-CHoCH block: {side.upper()}</b>\n"
                 f"Same-direction entries blocked for "
-                f"{self._CHOCH_BLOCK_DURATION_MS // 60_000}m.\\n"
+                f"{self._CHOCH_BLOCK_DURATION_MS // 60_000}m.\n"
                 f"Requires fresh {'bullish' if side == 'long' else 'bearish'} "
                 f"market structure to restart ICT cycle."
             )
@@ -4743,7 +4771,7 @@ class AdvancedICTStrategy:
                 side=sl_side, quantity=qty, trigger_price=new_sl)
 
             if result and "error" not in result:
-                self.sl_order_id = result.get("data", {}).get("order_id") or result.get("order_id")
+                self.sl_order_id = result.get("order_id")
                 logger.info(f"✅ SL updated to {new_sl:.2f} qty={qty}")
                 return True
 
@@ -4768,7 +4796,7 @@ class AdvancedICTStrategy:
                         side=sl_side, quantity=qty, trigger_price=emergency_sl)
 
                     if emg_result and "error" not in emg_result:
-                        self.sl_order_id = emg_result.get("data", {}).get("order_id") or emg_result.get("order_id")
+                        self.sl_order_id = emg_result.get("order_id")
                         logger.warning(f"🆘 Emergency SL placed at {emergency_sl:.2f} (wide)")
                         send_telegram_message(
                             f"🚨 <b>EMERGENCY SL</b>\n"
@@ -4843,8 +4871,7 @@ class AdvancedICTStrategy:
                     side=tp_side, quantity=use_qty, trigger_price=new_tp)
 
                 if result and "error" not in result:
-                    self.tp_order_id = (result.get("data", {}).get("order_id")
-                                        or result.get("order_id"))
+                    self.tp_order_id = result.get("order_id")
                     logger.info(
                         f"\u2705 TP {'placed' if not old_tp_id else 'replaced'} \u2192 "
                         f"{self.tp_order_id} @ ${new_tp:,.2f} qty={use_qty}"
@@ -4898,12 +4925,6 @@ class AdvancedICTStrategy:
             sl_side = "SELL" if side == "long" else "BUY"
             qty     = self.entry_quantity if self.entry_quantity > 0 else config.MIN_POSITION_SIZE
 
-            # Track consecutive UNKNOWN counts
-            if not hasattr(self, '_sl_unknown_count'):
-                self._sl_unknown_count = 0
-            if not hasattr(self, '_tp_unknown_count'):
-                self._tp_unknown_count = 0
-
             # ── Check SL ──────────────────────────────────────────────────
             if self.sl_order_id:
                 sl_status = order_manager.get_order_status_safe(self.sl_order_id)
@@ -4925,7 +4946,7 @@ class AdvancedICTStrategy:
                         side=sl_side, quantity=qty,
                         trigger_price=self.current_sl_price)
                     if sl_result and "error" not in sl_result:
-                        self.sl_order_id = sl_result.get("data", {}).get("order_id") or sl_result.get("order_id")
+                        self.sl_order_id = sl_result.get("order_id")
                         logger.info(f"✅ SL re-placed: {self.sl_order_id}")
                     else:
                         logger.error(f"❌ SL re-placement failed: {sl_result}")
@@ -4940,7 +4961,7 @@ class AdvancedICTStrategy:
                             side=sl_side, quantity=qty,
                             trigger_price=self.current_sl_price)
                         if sl_result and "error" not in sl_result:
-                            self.sl_order_id = sl_result.get("data", {}).get("order_id") or sl_result.get("order_id")
+                            self.sl_order_id = sl_result.get("order_id")
                             logger.info(f"✅ SL re-placed after persistent UNKNOWN: {self.sl_order_id}")
                         else:
                             logger.error(f"❌ SL re-placement failed: {sl_result}")
@@ -4957,7 +4978,7 @@ class AdvancedICTStrategy:
                     side=sl_side, quantity=qty,
                     trigger_price=self.current_sl_price)
                 if sl_result and "error" not in sl_result:
-                    self.sl_order_id = sl_result.get("data", {}).get("order_id") or sl_result.get("order_id")
+                    self.sl_order_id = sl_result.get("order_id")
 
             # ── Check TP ──────────────────────────────────────────────────
             if self.tp_order_id:
@@ -5025,7 +5046,7 @@ class AdvancedICTStrategy:
                         side=sl_side, quantity=remaining_qty,
                         trigger_price=self.current_sl_price)
                     if sl_result and "error" not in sl_result:
-                        self.sl_order_id = sl_result.get("data", {}).get("order_id") or sl_result.get("order_id")
+                        self.sl_order_id = sl_result.get("order_id")
                         logger.info(f"✅ SL re-placed with corrected qty={remaining_qty:.4f}: {self.sl_order_id}")
                     else:
                         logger.error(f"❌ SL re-place after partial TP failed: {sl_result}")
@@ -5333,8 +5354,7 @@ class AdvancedICTStrategy:
                         side=tp_side, quantity=qty, trigger_price=tp_price)
 
                     if result and "error" not in result:
-                        order_id = (result.get("data", {}).get("order_id")
-                                    or result.get("order_id"))
+                        order_id = result.get("order_id")
                         if order_id:
                             self.tp_order_id = order_id
                             logger.info(
@@ -5453,11 +5473,21 @@ class AdvancedICTStrategy:
         return self.entry_quantity if self.entry_quantity > 0 else config.MIN_POSITION_SIZE
 
     def _calculate_ema(self, data: List[float], period: int) -> float:
-        if len(data) < period:
+        """
+        Wilder-style EMA seeded from SMA of first `period` values.
+        Seeding from SMA(period) eliminates the cold-start bias that occurs
+        when the first raw data point is far from equilibrium (e.g. data[0]
+        at a swing extreme). Without this, the EMA can take 3× the period
+        to converge when fed from one end of a volatile price series.
+        """
+        n = len(data)
+        if n < 2:
             return data[-1] if data else 0.0
+        # If fewer values than period, fall back to simple mean of available data
+        seed_n = min(period, n)
+        ema = sum(data[:seed_n]) / seed_n
         mult = 2.0 / (period + 1)
-        ema = data[0]
-        for val in data[1:]:
+        for val in data[seed_n:]:
             ema = val * mult + ema * (1 - mult)
         return ema
 

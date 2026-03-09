@@ -216,7 +216,6 @@ class FuturesAPI:
         payload = {
             "order_id": order_id,
             "exchange": exchange,
-            "action": "cancel"  # Assuming API uses 'action' field; adjust if needed
         }
         
         return self._make_request("DELETE", endpoint, payload=payload)

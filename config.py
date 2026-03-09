@@ -283,7 +283,11 @@ ENTRY_PENDING_TIMEOUT_SECONDS      = ORDER_TIMEOUT_SECONDS  # was 120 — use OR
 # LOGGING / REPORTING
 # ─────────────────────────────────────────────
 LOG_LEVEL                    = "INFO"
-TELEGRAM_REPORT_INTERVAL_SEC = 900.0
+# Consolidated Telegram report interval — handled EXCLUSIVELY by strategy.py
+# (_log_market_outlook → format_market_outlook).  main.py periodic report is
+# intentionally disabled (its format_periodic_report call was removed) to
+# prevent duplicate messages every 15 minutes.
+TELEGRAM_REPORT_INTERVAL_SEC = 0          # DISABLED — strategy.py is sole reporter
 OUTLOOK_INTERVAL_SECONDS     = 900        # 15 min — single consolidated Telegram report
 
 # ─────────────────────────────────────────────

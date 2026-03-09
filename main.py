@@ -23,7 +23,6 @@ from strategy import AdvancedICTStrategy
 from telegram_notifier import (
     install_global_telegram_log_handler,
     send_telegram_message,
-    format_periodic_report,
 )
 
 logging.basicConfig(
@@ -42,7 +41,6 @@ install_global_telegram_log_handler(level=logging.WARNING, throttle_seconds=5.0)
 class ICTBot:
     def __init__(self) -> None:
         self.running               = False
-        self.last_report_sec       = 0.0
         self.last_health_check_sec = 0.0
 
         self.data_manager:  Optional[ICTDataManager]      = None
@@ -216,8 +214,6 @@ class ICTBot:
                     self.risk_manager,
                     int(time.time() * 1000))
 
-                self.maybe_send_telegram_report()
-
             except KeyboardInterrupt:
                 logger.info("Keyboard interrupt")
                 break
@@ -226,88 +222,6 @@ class ICTBot:
                 time.sleep(1.0)
 
         self.running = False
-
-    # =================================================================
-    # PERIODIC TELEGRAM REPORT
-    # =================================================================
-
-    def maybe_send_telegram_report(self) -> None:
-        interval = float(config.TELEGRAM_REPORT_INTERVAL_SEC)
-        if interval <= 0:
-            return
-
-        now = time.time()
-        if now - self.last_report_sec < interval:
-            return
-        self.last_report_sec = now
-
-        if not all([self.strategy, self.data_manager, self.risk_manager]):
-            return
-
-        try:
-            last_price   = self.data_manager.get_last_price()
-            balance_info = self.risk_manager.get_available_balance()
-            strat        = self.strategy
-            stats        = strat.get_strategy_stats()
-
-            win_rate = stats.get("win_rate_pct", 0.0)
-
-            # DR price strings
-            ndr = strat._ndr
-            dr_w = f"${ndr.weekly.low:,.0f}–${ndr.weekly.high:,.0f}" if ndr.weekly else "—"
-            dr_d = f"${ndr.daily.low:,.0f}–${ndr.daily.high:,.0f}" if ndr.daily else "—"
-            dr_i = f"${ndr.intraday.low:,.0f}–${ndr.intraday.high:,.0f}" if ndr.intraday else "—"
-
-            # Regime context
-            rs = strat.regime_engine.state
-            regime_line = (
-                f"Regime: {rs.regime} "
-                f"ADX={rs.adx:.1f} "
-                f"ATR×={rs.atr_ratio:.2f} "
-                f"Size×={rs.size_multiplier:.2f}")
-
-            msg = format_periodic_report(
-                current_price=last_price,
-                balance=(balance_info.get("available", 0.0)
-                         if balance_info else 0.0),
-                total_trades=stats.get("total_exits", 0),
-                win_rate=win_rate,
-                daily_pnl=stats.get("daily_pnl", 0.0),
-                total_pnl=stats.get("total_pnl", 0.0),
-                consecutive_losses=stats.get("consecutive_losses", 0),
-                htf_bias=strat.htf_bias,
-                htf_bias_strength=strat.htf_bias_strength,
-                daily_bias=strat.daily_bias,
-                session=strat.current_session,
-                in_killzone=strat.in_killzone,
-                amd_phase=strat.amd_phase,
-                bot_state=strat.state,
-                regime=rs.regime,
-                regime_adx=rs.adx,
-                position=strat.get_position(),
-                current_sl=strat.current_sl_price,
-                current_tp=strat.current_tp_price,
-                entry_price=strat.initial_entry_price,
-                breakeven_moved=strat.breakeven_moved,
-                profit_locked_pct=strat.profit_locked_pct,
-                bull_obs=len(strat.order_blocks_bull),
-                bear_obs=len(strat.order_blocks_bear),
-                bull_fvgs=len(strat.fvgs_bull),
-                bear_fvgs=len(strat.fvgs_bear),
-                liq_pools=len(strat.liquidity_pools),
-                swing_h=len(strat.swing_highs),
-                swing_l=len(strat.swing_lows),
-                mss_count=len(strat.market_structures),
-                dr_weekly_str=dr_w,
-                dr_daily_str=dr_d,
-                dr_intraday_str=dr_i,
-                volume_delta=self.data_manager.get_volume_delta(lookback_seconds=300),
-                extra_lines=[regime_line],
-            )
-            send_telegram_message(msg)
-
-        except Exception:
-            logger.exception("❌ Failed to send Telegram report")
 
     # =================================================================
     # STOP

@@ -309,7 +309,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
@@ -367,7 +366,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
@@ -423,7 +421,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
@@ -479,7 +476,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
@@ -536,7 +532,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
@@ -592,7 +587,6 @@ class ICTDataManager:
                 method="GET",
                 endpoint="/trade/api/v2/futures/klines",
                 params=params,
-                payload={},
             )
             
             if not isinstance(resp, dict):
