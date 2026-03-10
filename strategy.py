@@ -2443,32 +2443,16 @@ class AdvancedICTStrategy:
                         )
                     continue
 
-                # ── ATR SL DISTANCE PRE-VALIDATION ────────────────────────
-                # Reject if the closest structural SL anchor is < 0.5 ATR away.
-                # SL too tight = stopped out by normal volatility / noise.
-                atr_now = self._compute_atr_for_trailing(data_manager)
-                if atr_now > 0:
-                    sl_anchor: Optional[float] = None
-                    if ctx.trigger_ob is not None:
-                        sl_anchor = (ctx.trigger_ob.low  if side == "long"
-                                     else ctx.trigger_ob.high)
-                    elif side == "long" and ctx.nearest_swing_low is not None:
-                        sl_anchor = ctx.nearest_swing_low
-                    elif side == "short" and ctx.nearest_swing_high is not None:
-                        sl_anchor = ctx.nearest_swing_high
-
-                    if sl_anchor is not None:
-                        sl_dist    = abs(current_price - sl_anchor)
-                        min_sl_req = atr_now * 1.0   # v11: minimum 1.0 ATR, was 0.5
-                        if sl_dist < min_sl_req:
-                            rej_key = f"SL_TIGHT_{side}"
-                            if self._should_log_rejection(side, rej_key, now_ms):
-                                logger.info(
-                                    f"⛔ {side.upper()} SL too tight: "
-                                    f"{sl_dist:.1f} < 1.0×ATR({atr_now:.1f})={min_sl_req:.1f} "
-                                    f"— entry would be stopped by noise"
-                                )
-                            continue
+                # ── ATR SL DISTANCE PRE-VALIDATION (REMOVED) ─────────────────
+                # Previously blocked when raw anchor distance < 1.0×ATR.
+                # But _calculate_levels already pushes SL to 1.5×ATR minimum,
+                # then validates MAX_SL_DISTANCE_PCT and RR ratio. The pre-check
+                # was redundant AND overly conservative: it rejected trades where
+                # the raw anchor was close but the pushed SL would be perfectly valid.
+                # Example: anchor $73 from price (fails 1.0×ATR=$212), but
+                # _calculate_levels pushes SL to 1.5×ATR=$319 → RR=3.1x → VALID.
+                # Removal confirmed safe: all rejection paths in _calculate_levels
+                # return (None, None, None) which _execute_entry handles.
 
                 # ── PASSED ALL GATES — attempt entry ──────────────────────
                 # v11: Verify price is actually in an entry zone (OB or FVG)
