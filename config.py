@@ -41,6 +41,9 @@ MIN_MARGIN_PER_TRADE     = 4        # USDT minimum margin
 MAX_MARGIN_PER_TRADE     = 10_000   # USDT maximum margin
 MIN_POSITION_SIZE        = 0.001    # BTC minimum
 MAX_POSITION_SIZE        = 1.0      # BTC maximum
+REMAINDER_MIN_QTY        = 0.0001   # BTC — exchange minimum for remainder limit orders
+                                     # Lower than MIN_POSITION_SIZE so partial fills
+                                     # can place remainder orders for small unfilled qty
 
 
 # ─────────────────────────────────────────────
@@ -337,3 +340,8 @@ RANGE_BOUND_TP_PREFER_STRUCTURE = True   # prefer OB/FVG/liq targets over raw DR
 # ── Cooldown & limits ──
 RANGE_BOUND_MAX_DAILY_TRADES = 4         # separate cap (range trades tend to cluster)
 RANGE_BOUND_MIN_CANDLES_5M   = 60        # need enough data to confirm range
+
+# ── Trailing SL ──
+# Range-bound trades don't produce BOS (market is ranging by definition).
+# Instead of waiting for BOS to activate trailing, use profit-based gate.
+RANGE_BOUND_TRAIL_ACTIVATION_RR = 0.5    # activate trail after 0.5R in profit

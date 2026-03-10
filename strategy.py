@@ -487,6 +487,9 @@ class AdvancedICTStrategy:
         self._range_bound_active:  bool = False
         self._range_bound_daily_trades: int  = 0
         self._range_bound_trade_day:    int  = 0   # day-of-year for reset
+        # Stable flag: set once at entry, survives _build_trade_plan dry-runs
+        # that toggle _range_bound_active as a side effect of _cascade_l1.
+        self._entry_was_range_bound: bool = False
 
         logger.info("✅ AdvancedICTStrategy v11 created (single TP/SL, structure trailing, sniper entry)")
 
@@ -669,6 +672,7 @@ class AdvancedICTStrategy:
                         "side":        restored_side,
                         "size":        restored_size,
                         "entry_price": restored_entry,
+                        "entry_time":  int(time.time() * 1000),  # use now — actual entry time unknown
                     }
                     self.initial_entry_price = restored_entry
 
@@ -697,6 +701,14 @@ class AdvancedICTStrategy:
                     # Switch the state machine to active — the management loop
                     # (_manage_active_position) will now run on every tick.
                     self.state = "POSITION_ACTIVE"
+                    self.entry_quantity = restored_size
+                    # Set initial SL/TP from recovered values so trailing SL
+                    # can compute risk = abs(entry - initial_sl_price).
+                    # Without this, trailing SL would skip (initial_sl_price=None).
+                    if self.current_sl_price:
+                        self.initial_sl_price = self.current_sl_price
+                    if self.current_tp_price:
+                        self.initial_tp_price = self.current_tp_price
 
                     send_telegram_message(
                         f"🔄 <b>STARTUP RECOVERY</b> — Position Restored\n"
@@ -1010,6 +1022,13 @@ class AdvancedICTStrategy:
         """
         plan: Dict = {"side": side, "status": "EVALUATING"}
 
+        # ── SIDE-EFFECT GUARD ─────────────────────────────────────────
+        # _cascade_l1 toggles self._range_bound_active as a side effect.
+        # Since _build_trade_plan is a dry-run (called for BOTH sides every
+        # 30s), the second call (e.g. short) would overwrite the value set
+        # by the first call (e.g. long). Save and restore to prevent this.
+        _saved_rb_active = self._range_bound_active
+
         try:
             # ── Risk gate check (mirror what _evaluate_entry does) ────────────
             # Checked FIRST so the outlook accurately reflects actual tradability.
@@ -1157,6 +1176,9 @@ class AdvancedICTStrategy:
             plan["status"] = "ERROR"
             plan["gate_failed"] = str(e)
             return plan
+        finally:
+            # Restore to prevent dry-run side-effects on strategy state
+            self._range_bound_active = _saved_rb_active
 
     def _log_trade_plan(self, label: str, plan: Dict, price: float) -> None:
         """Log a trade plan to console."""
@@ -3809,6 +3831,7 @@ class AdvancedICTStrategy:
 
             # Update state
             self._trade_side    = side 
+            self._entry_was_range_bound = is_range_trade   # stable flag for trail activation
             self.entry_order_id   = order_id
             self.state            = "ENTRY_PENDING"
             self.entry_pending_start = current_time
@@ -4187,7 +4210,13 @@ class AdvancedICTStrategy:
             _QTY_TOL = 0.0001
             if abs(actual_qty - pre_placed_qty) > _QTY_TOL:
                 _remainder_qty = round(pre_placed_qty - actual_qty, 4)
-                if _remainder_qty >= config.MIN_POSITION_SIZE:
+                # Use REMAINDER_MIN_QTY (exchange minimum, e.g. 0.0001 BTC)
+                # NOT MIN_POSITION_SIZE (0.001) — remainder orders are additive
+                # to an already-open position, so the normal entry minimum
+                # doesn't apply.  Placing the remainder ensures the full
+                # intended position size is achieved.
+                _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.0001)
+                if _remainder_qty >= _rem_min:
                     logger.info(
                         f"📐 Partial fill detected — placing remainder order: "
                         f"{_remainder_qty:.4f} BTC @ ${self.initial_entry_price:,.2f} "
@@ -4223,8 +4252,8 @@ class AdvancedICTStrategy:
                         )
                 else:
                     logger.info(
-                        f"📐 Remainder qty {_remainder_qty:.4f} BTC below MIN_POSITION_SIZE "
-                        f"({config.MIN_POSITION_SIZE}) — skipping remainder order"
+                        f"📐 Remainder qty {_remainder_qty:.4f} BTC below exchange minimum "
+                        f"({_rem_min}) — skipping remainder order"
                     )
 
         except Exception as e:
@@ -4692,8 +4721,15 @@ class AdvancedICTStrategy:
 
             entry_time = self.active_position.get("entry_time", 0)
 
-            # ── Activation gate: wait for first BOS in trade direction ────────
+            # ── Activation gate ───────────────────────────────────────────────
+            # Two activation methods (first to trigger wins):
+            #   1. BOS confirmation: a BOS in trade direction after entry (directional trades)
+            #   2. Profit gate: profit >= 0.5R (range-bound trades — BOS doesn't form in ranges)
+            # Both methods are checked for ALL trade types. This means directional
+            # trades that run fast (no BOS yet) can also benefit from the profit gate
+            # if they were entered range-bound.
             if not self._trail_activated:
+                # Method 1: BOS in trade direction after entry
                 required_direction = "bullish" if side == "long" else "bearish"
                 bos_confirmed = any(
                     ms.structure_type == "BOS"
@@ -4702,17 +4738,31 @@ class AdvancedICTStrategy:
                     and ms.timestamp   >  entry_time
                     for ms in self.market_structures
                 )
-                if not bos_confirmed:
+
+                # Method 2: Profit-based gate for range-bound trades
+                # Range markets don't produce BOS — the SL would NEVER trail without this.
+                rb_profit_gate = False
+                if self._entry_was_range_bound and risk > 0:
+                    profit = (current_price - entry) if side == "long" else (entry - current_price)
+                    rb_activation_rr = getattr(config, "RANGE_BOUND_TRAIL_ACTIVATION_RR", 0.5)
+                    rb_profit_gate = profit >= risk * rb_activation_rr
+
+                if bos_confirmed or rb_profit_gate:
+                    self._trail_activated = True
+                    trigger = (
+                        f"{required_direction.upper()} BOS confirmed after entry"
+                        if bos_confirmed
+                        else f"range-bound {profit / risk:.1f}R profit gate"
+                    )
+                    logger.info(f"✅ Trail ACTIVATED — {trigger}. SL will now trail structure.")
+                else:
                     logger.debug(
-                        f"⏳ Trail inactive — waiting for first {required_direction.upper()} "
-                        f"BOS after entry to activate structural trailing"
+                        f"⏳ Trail inactive — waiting for {required_direction.upper()} BOS"
+                        + (f" or {getattr(config, 'RANGE_BOUND_TRAIL_ACTIVATION_RR', 0.5)}R profit"
+                           if self._entry_was_range_bound else "")
+                        + " after entry"
                     )
                     return
-                self._trail_activated = True
-                logger.info(
-                    f"✅ Trail ACTIVATED — {required_direction.upper()} BOS confirmed "
-                    f"after entry. SL will now trail structure."
-                )
 
             # ── ATR — mandatory, no fallback ──────────────────────────────────
             atr = self._compute_atr_for_trailing(data_manager)
@@ -5307,15 +5357,9 @@ class AdvancedICTStrategy:
                 incremental_fill = round(cumulative_filled - self._remainder_accounted_fill, 4)
 
                 if incremental_fill <= 0:
-                    # No new fills since last check — nothing to do.
-                    # Status may still show PARTIAL_FILL from a previous fill.
-                    logger.debug(
-                        f"📐 Remainder order: no new fills (cumulative={cumulative_filled:.4f}, "
-                        f"accounted={self._remainder_accounted_fill:.4f})"
-                    )
-                    # If status is FILLED but incremental is 0, it means we already
-                    # processed everything — just clean up tracking state.
+                    # No new fills since last check — status lingering from previous fill.
                     if status == "FILLED":
+                        # Fully consumed but we already processed it — clean up
                         self.remainder_order_id  = None
                         self.remainder_order_qty = 0.0
                         self.remainder_order_price = 0.0
@@ -5432,10 +5476,10 @@ class AdvancedICTStrategy:
                     logger.info("📐 Remainder order fully consumed — tracking cleared")
                 else:
                     # Still partially pending — keep monitoring same order ID
-                    # remainder_order_qty tracks how much is STILL unfilled
                     self.remainder_order_qty = round(
                         self.remainder_order_qty - incremental_fill, 4)
-                    if self.remainder_order_qty >= config.MIN_POSITION_SIZE:
+                    _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.0001)
+                    if self.remainder_order_qty >= _rem_min:
                         logger.info(
                             f"📐 Remainder order still partially open: "
                             f"{self.remainder_order_qty:.4f} BTC remaining — continuing to monitor"
@@ -5770,6 +5814,7 @@ class AdvancedICTStrategy:
         self.max_adverse_excursion   = 0.0
         self._trade_side             = None
         self._range_bound_active     = False
+        self._entry_was_range_bound  = False
         # Remainder order state
         self.remainder_order_id      = None
         self.remainder_order_qty     = 0.0
