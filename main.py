@@ -13,6 +13,7 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import config
@@ -25,13 +26,37 @@ from telegram_notifier import (
     send_telegram_message,
 )
 
+# ── IST Timezone Logging ────────────────────────────────────────────
+# All log timestamps in Indian Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+class ISTFormatter(logging.Formatter):
+    """Logging formatter that emits timestamps in IST (UTC+5:30)."""
+    converter = None  # disable default localtime/gmtime converter
+
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=IST)
+        if datefmt:
+            return dt.strftime(datefmt)
+        # Match default logging format: YYYY-MM-DD HH:MM:SS,mmm
+        s = dt.strftime("%Y-%m-%d %H:%M:%S")
+        return f"{s},{int(record.msecs):03d}"
+
+
+_ist_fmt = ISTFormatter(
+    fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+
+_file_handler = logging.FileHandler("ict_bot.log")
+_file_handler.setFormatter(_ist_fmt)
+
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_ist_fmt)
+
 logging.basicConfig(
     level=getattr(config, "LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("ict_bot.log"),
-        logging.StreamHandler(),
-    ],
+    handlers=[_file_handler, _stream_handler],
 )
 logger = logging.getLogger(__name__)
 

@@ -439,6 +439,7 @@ class AdvancedICTStrategy:
         self.remainder_order_qty:   float           = 0.0   # BTC still pending
         self.remainder_order_price: float           = 0.0   # same as initial_entry_price
         self._last_remainder_check_ms: int          = 0     # throttle polling
+        self._remainder_accounted_fill: float       = 0.0   # cumulative fill already processed
 
         # Outlook interval (5 minutes)
         self._OUTLOOK_INTERVAL_MS = getattr(config, "OUTLOOK_INTERVAL_SECONDS", 300) * 1000
@@ -4203,6 +4204,7 @@ class AdvancedICTStrategy:
                         self.remainder_order_id    = _rem_result.get("order_id")
                         self.remainder_order_qty   = _remainder_qty
                         self.remainder_order_price = self.initial_entry_price
+                        self._remainder_accounted_fill = 0.0   # fresh order, no fills yet
                         logger.info(
                             f"✅ Remainder order placed: {self.remainder_order_id} "
                             f"@ ${self.initial_entry_price:,.2f} qty={_remainder_qty:.4f} BTC"
@@ -5292,18 +5294,45 @@ class AdvancedICTStrategy:
                 fill_info = order_manager.get_fill_details(self.remainder_order_id)
 
                 if fill_info and fill_info.get("filled_qty", 0) > 0:
-                    filled_remainder = fill_info["filled_qty"]
+                    cumulative_filled = fill_info["filled_qty"]
                 else:
                     # Fallback: assume full remainder qty if exchange doesn't report
-                    filled_remainder = self.remainder_order_qty
+                    cumulative_filled = self.remainder_order_qty + self._remainder_accounted_fill
 
-                new_total_qty = round(self.entry_quantity + filled_remainder, 4)
+                # ── CRITICAL: compute INCREMENTAL fill since last check ────────
+                # get_fill_details returns CUMULATIVE filled_qty for the order.
+                # Without this delta, repeated PARTIAL_FILL checks would add the
+                # same cumulative amount to entry_quantity on every 30s poll,
+                # inflating the position size and causing SL/TP qty rejection.
+                incremental_fill = round(cumulative_filled - self._remainder_accounted_fill, 4)
+
+                if incremental_fill <= 0:
+                    # No new fills since last check — nothing to do.
+                    # Status may still show PARTIAL_FILL from a previous fill.
+                    logger.debug(
+                        f"📐 Remainder order: no new fills (cumulative={cumulative_filled:.4f}, "
+                        f"accounted={self._remainder_accounted_fill:.4f})"
+                    )
+                    # If status is FILLED but incremental is 0, it means we already
+                    # processed everything — just clean up tracking state.
+                    if status == "FILLED":
+                        self.remainder_order_id  = None
+                        self.remainder_order_qty = 0.0
+                        self.remainder_order_price = 0.0
+                        self._remainder_accounted_fill = 0.0
+                        logger.info("📐 Remainder order fully consumed (final cleanup)")
+                    return
+
+                # Update accounting BEFORE doing anything else
+                self._remainder_accounted_fill = cumulative_filled
+
                 is_full = (status == "FILLED")
+                new_total_qty = round(self.entry_quantity + incremental_fill, 4)
 
                 logger.info(
                     f"📐 Remainder order {'fully' if is_full else 'partially'} filled: "
-                    f"+{filled_remainder:.4f} BTC → total position now "
-                    f"{new_total_qty:.4f} BTC"
+                    f"+{incremental_fill:.4f} BTC (cumulative {cumulative_filled:.4f}) "
+                    f"→ total position now {new_total_qty:.4f} BTC"
                 )
 
                 # Update entry_quantity and active_position dict
@@ -5334,6 +5363,7 @@ class AdvancedICTStrategy:
                         )
                         self.remainder_order_id  = None
                         self.remainder_order_qty = 0.0
+                        self._remainder_accounted_fill = 0.0
                         return
                     if isinstance(new_sl, dict) and "error" not in new_sl:
                         self.sl_order_id = new_sl.get("order_id")
@@ -5368,6 +5398,7 @@ class AdvancedICTStrategy:
                         )
                         self.remainder_order_id  = None
                         self.remainder_order_qty = 0.0
+                        self._remainder_accounted_fill = 0.0
                         return
                     if isinstance(new_tp, dict) and "error" not in new_tp:
                         self.tp_order_id = new_tp.get("order_id")
@@ -5386,7 +5417,7 @@ class AdvancedICTStrategy:
 
                 send_telegram_message(
                     f"📐 <b>Remainder Order Filled</b>\n"
-                    f"+{filled_remainder:.4f} BTC added to position\n"
+                    f"+{incremental_fill:.4f} BTC added to position\n"
                     f"Total position: {new_total_qty:.4f} BTC\n"
                     f"SL/TP re-adjusted to {new_total_qty:.4f} BTC"
                 )
@@ -5397,21 +5428,24 @@ class AdvancedICTStrategy:
                     self.remainder_order_id  = None
                     self.remainder_order_qty = 0.0
                     self.remainder_order_price = 0.0
+                    self._remainder_accounted_fill = 0.0
                     logger.info("📐 Remainder order fully consumed — tracking cleared")
                 else:
                     # Still partially pending — keep monitoring same order ID
-                    still_remaining = round(self.remainder_order_qty - filled_remainder, 4)
-                    if still_remaining >= config.MIN_POSITION_SIZE:
-                        self.remainder_order_qty = still_remaining
+                    # remainder_order_qty tracks how much is STILL unfilled
+                    self.remainder_order_qty = round(
+                        self.remainder_order_qty - incremental_fill, 4)
+                    if self.remainder_order_qty >= config.MIN_POSITION_SIZE:
                         logger.info(
                             f"📐 Remainder order still partially open: "
-                            f"{still_remaining:.4f} BTC remaining — continuing to monitor"
+                            f"{self.remainder_order_qty:.4f} BTC remaining — continuing to monitor"
                         )
                     else:
                         # Dust qty — not worth chasing
                         self.remainder_order_id  = None
                         self.remainder_order_qty = 0.0
                         self.remainder_order_price = 0.0
+                        self._remainder_accounted_fill = 0.0
 
             # ── Cancelled / rejected / expired ────────────────────────────
             elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
@@ -5422,6 +5456,7 @@ class AdvancedICTStrategy:
                 self.remainder_order_id    = None
                 self.remainder_order_qty   = 0.0
                 self.remainder_order_price = 0.0
+                self._remainder_accounted_fill = 0.0
 
             # PENDING / UNKNOWN — keep monitoring silently
 
@@ -5450,6 +5485,7 @@ class AdvancedICTStrategy:
             self.remainder_order_id    = None
             self.remainder_order_qty   = 0.0
             self.remainder_order_price = 0.0
+            self._remainder_accounted_fill = 0.0
 
     def _on_position_closed(self, side: str, close_price: float, current_time: int) -> None:
         try:
@@ -5738,6 +5774,7 @@ class AdvancedICTStrategy:
         self.remainder_order_id      = None
         self.remainder_order_qty     = 0.0
         self.remainder_order_price   = 0.0
+        self._remainder_accounted_fill = 0.0
 
     def _cancel_pending_sl_tp(self, order_manager) -> None:
         """Cancel pre-placed SL and TP orders when entry is cancelled with no fill.
