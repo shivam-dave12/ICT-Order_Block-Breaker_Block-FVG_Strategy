@@ -431,6 +431,15 @@ class AdvancedICTStrategy:
         self._sl_unknown_count: int    = 0
         self._tp_unknown_count: int    = 0
 
+        # ── Partial-fill remainder order tracking ─────────────────────────
+        # When an entry limit order is only partially filled, we place a new
+        # limit order for the unfilled qty at the same price.  When that order
+        # fills, SL/TP are replaced with the updated combined position qty.
+        self.remainder_order_id:    Optional[str]   = None
+        self.remainder_order_qty:   float           = 0.0   # BTC still pending
+        self.remainder_order_price: float           = 0.0   # same as initial_entry_price
+        self._last_remainder_check_ms: int          = 0     # throttle polling
+
         # Outlook interval (5 minutes)
         self._OUTLOOK_INTERVAL_MS = getattr(config, "OUTLOOK_INTERVAL_SECONDS", 300) * 1000
 
@@ -4162,6 +4171,53 @@ class AdvancedICTStrategy:
 
             logger.info(f"✅ Position active: {side} SL_ID={self.sl_order_id} TP_ID={self.tp_order_id}")
 
+            # ── PARTIAL FILL REMAINDER ORDER ──────────────────────────────────
+            # If the entry order was only partially filled, place a new limit
+            # order for the unfilled qty at the same limit price.  The SL/TP
+            # above already protect the current (partial) position size.
+            # _check_remainder_order() will extend them when this order fills.
+            _QTY_TOL = 0.0001
+            if abs(actual_qty - pre_placed_qty) > _QTY_TOL:
+                _remainder_qty = round(pre_placed_qty - actual_qty, 4)
+                if _remainder_qty >= config.MIN_POSITION_SIZE:
+                    logger.info(
+                        f"📐 Partial fill detected — placing remainder order: "
+                        f"{_remainder_qty:.4f} BTC @ ${self.initial_entry_price:,.2f} "
+                        f"(filled {actual_qty:.4f}/{pre_placed_qty:.4f})"
+                    )
+                    _entry_side = "BUY" if side == "LONG" else "SELL"
+                    GlobalRateLimiter.wait()
+                    _rem_result = order_manager.place_limit_order(
+                        side=_entry_side,
+                        quantity=_remainder_qty,
+                        price=self.initial_entry_price,
+                    )
+                    if _rem_result and "error" not in _rem_result:
+                        self.remainder_order_id    = _rem_result.get("order_id")
+                        self.remainder_order_qty   = _remainder_qty
+                        self.remainder_order_price = self.initial_entry_price
+                        logger.info(
+                            f"✅ Remainder order placed: {self.remainder_order_id} "
+                            f"@ ${self.initial_entry_price:,.2f} qty={_remainder_qty:.4f} BTC"
+                        )
+                        send_telegram_message(
+                            f"📐 <b>Partial Fill — Remainder Order Placed</b>\n"
+                            f"Filled: {actual_qty:.4f} / {pre_placed_qty:.4f} BTC\n"
+                            f"Remainder limit: {_remainder_qty:.4f} BTC "
+                            f"@ ${self.initial_entry_price:,.2f}\n"
+                            f"SL/TP currently sized for filled qty only"
+                        )
+                    else:
+                        logger.warning(
+                            f"⚠️ Remainder order placement failed: {_rem_result} — "
+                            f"position stays at {actual_qty:.4f} BTC"
+                        )
+                else:
+                    logger.info(
+                        f"📐 Remainder qty {_remainder_qty:.4f} BTC below MIN_POSITION_SIZE "
+                        f"({config.MIN_POSITION_SIZE}) — skipping remainder order"
+                    )
+
         except Exception as e:
             logger.error(f"❌ Entry fill handler error: {e}", exc_info=True)
             # If an exception prevented us from reaching state="POSITION_ACTIVE",
@@ -4193,6 +4249,10 @@ class AdvancedICTStrategy:
                 return
 
             side = self.active_position.get("side", "long")
+
+            # ── Poll remainder order (rate-limited internally) ─────────────────
+            if self.remainder_order_id:
+                self._check_remainder_order(order_manager, current_time)
 
             # ── Track extremes ────────────────────────────────────────────────
             if self.highest_price_reached is None or current_price > self.highest_price_reached:
@@ -5159,6 +5219,203 @@ class AdvancedICTStrategy:
         except Exception as e:
             logger.error(f"Position check error: {e}", exc_info=True)
 
+    # ==================================================================
+    # REMAINDER ORDER MONITOR
+    # Polls the pending remainder limit order (placed when entry was only
+    # partially filled) and re-sizes SL/TP when it fills.
+    # ==================================================================
+
+    def _check_remainder_order(self, order_manager, current_time: int) -> None:
+        """
+        Poll the remainder limit order placed after a partial entry fill.
+
+        Called every tick from _manage_active_position() but internally
+        throttled to REMAINDER_CHECK_INTERVAL_SEC (default 30s) to avoid
+        burning rate-limit budget.
+
+        On fill:
+          1. Add filled_remainder to entry_quantity.
+          2. Replace SL/TP via replace_stop_loss / replace_take_profit so they
+             cover the full combined position size.
+          3. Clear remainder state when order fully consumed.
+
+        On cancel/reject/expire:
+          Simply clear remainder state — position keeps its current qty.
+        """
+        if not self.remainder_order_id:
+            return
+
+        # Throttle: at most one check per REMAINDER_CHECK_INTERVAL_SEC
+        _interval_ms = int(
+            getattr(config, "REMAINDER_CHECK_INTERVAL_SEC", 30) * 1000
+        )
+        if (current_time - self._last_remainder_check_ms) < _interval_ms:
+            return
+        self._last_remainder_check_ms = current_time
+
+        try:
+            GlobalRateLimiter.wait()
+            status = order_manager.get_order_status_safe(self.remainder_order_id)
+            logger.debug(
+                f"📐 Remainder order {self.remainder_order_id} status: {status}"
+            )
+
+            # ── Filled (full or partial) ───────────────────────────────────
+            if status in ("FILLED", "PARTIAL_FILL"):
+                GlobalRateLimiter.wait()
+                fill_info = order_manager.get_fill_details(self.remainder_order_id)
+
+                if fill_info and fill_info.get("filled_qty", 0) > 0:
+                    filled_remainder = fill_info["filled_qty"]
+                else:
+                    # Fallback: assume full remainder qty if exchange doesn't report
+                    filled_remainder = self.remainder_order_qty
+
+                new_total_qty = round(self.entry_quantity + filled_remainder, 4)
+                is_full = (status == "FILLED")
+
+                logger.info(
+                    f"📐 Remainder order {'fully' if is_full else 'partially'} filled: "
+                    f"+{filled_remainder:.4f} BTC → total position now "
+                    f"{new_total_qty:.4f} BTC"
+                )
+
+                # Update entry_quantity and active_position dict
+                self.entry_quantity = new_total_qty
+                if self.active_position:
+                    self.active_position["quantity"] = new_total_qty
+
+                side = (
+                    self.active_position.get("side", "long")
+                    if self.active_position else "long"
+                )
+                sl_side = "SELL" if side == "long" else "BUY"
+
+                # ── Replace SL with combined qty ──────────────────────────
+                if self.current_sl_price:
+                    GlobalRateLimiter.wait()
+                    new_sl = order_manager.replace_stop_loss(
+                        existing_sl_order_id = self.sl_order_id,
+                        side                 = sl_side,
+                        quantity             = new_total_qty,
+                        new_trigger_price    = self.current_sl_price,
+                    )
+                    if new_sl is None:
+                        # SL already fired — position is closed; remainder moot
+                        logger.warning(
+                            "⚠️ SL fired during remainder fill adjustment — "
+                            "position already closed, clearing remainder state"
+                        )
+                        self.remainder_order_id  = None
+                        self.remainder_order_qty = 0.0
+                        return
+                    if isinstance(new_sl, dict) and "error" not in new_sl:
+                        self.sl_order_id = new_sl.get("order_id")
+                        logger.info(
+                            f"✅ SL updated for remainder fill: "
+                            f"qty={new_total_qty:.4f} BTC @ ${self.current_sl_price:,.2f}"
+                        )
+                    else:
+                        logger.error(
+                            f"❌ SL replace failed after remainder fill: {new_sl}"
+                        )
+
+                # ── Replace TP with combined qty ──────────────────────────
+                if self.current_tp_price:
+                    GlobalRateLimiter.wait()
+                    new_tp = order_manager.replace_take_profit(
+                        existing_tp_order_id = self.tp_order_id,
+                        side                 = sl_side,
+                        quantity             = new_total_qty,
+                        new_trigger_price    = self.current_tp_price,
+                    )
+                    if new_tp is None:
+                        # TP already fired — position is closed
+                        logger.warning(
+                            "⚠️ TP fired during remainder fill adjustment — "
+                            "position already closed, clearing remainder state"
+                        )
+                        self.remainder_order_id  = None
+                        self.remainder_order_qty = 0.0
+                        return
+                    if isinstance(new_tp, dict) and "error" not in new_tp:
+                        self.tp_order_id = new_tp.get("order_id")
+                        logger.info(
+                            f"✅ TP updated for remainder fill: "
+                            f"qty={new_total_qty:.4f} BTC @ ${self.current_tp_price:,.2f}"
+                        )
+                    else:
+                        logger.error(
+                            f"❌ TP replace failed after remainder fill: {new_tp}"
+                        )
+
+                send_telegram_message(
+                    f"📐 <b>Remainder Order Filled</b>\n"
+                    f"+{filled_remainder:.4f} BTC added to position\n"
+                    f"Total position: {new_total_qty:.4f} BTC\n"
+                    f"SL/TP re-adjusted to {new_total_qty:.4f} BTC"
+                )
+
+                # ── Update remainder tracking ──────────────────────────────
+                if is_full:
+                    # Order fully consumed — nothing left to monitor
+                    self.remainder_order_id  = None
+                    self.remainder_order_qty = 0.0
+                    self.remainder_order_price = 0.0
+                    logger.info("📐 Remainder order fully consumed — tracking cleared")
+                else:
+                    # Still partially pending — keep monitoring same order ID
+                    still_remaining = round(self.remainder_order_qty - filled_remainder, 4)
+                    if still_remaining >= config.MIN_POSITION_SIZE:
+                        self.remainder_order_qty = still_remaining
+                        logger.info(
+                            f"📐 Remainder order still partially open: "
+                            f"{still_remaining:.4f} BTC remaining — continuing to monitor"
+                        )
+                    else:
+                        # Dust qty — not worth chasing
+                        self.remainder_order_id  = None
+                        self.remainder_order_qty = 0.0
+                        self.remainder_order_price = 0.0
+
+            # ── Cancelled / rejected / expired ────────────────────────────
+            elif status in ("CANCELLED", "REJECTED", "EXPIRED"):
+                logger.info(
+                    f"📐 Remainder order {self.remainder_order_id} {status} — "
+                    f"clearing; position stays at {self.entry_quantity:.4f} BTC"
+                )
+                self.remainder_order_id    = None
+                self.remainder_order_qty   = 0.0
+                self.remainder_order_price = 0.0
+
+            # PENDING / UNKNOWN — keep monitoring silently
+
+        except Exception as e:
+            logger.error(f"_check_remainder_order error: {e}", exc_info=True)
+
+    def _cancel_remainder_order(self, order_manager) -> None:
+        """
+        Cancel the pending remainder limit order, if any.
+        Called when the main position is closed (SL/TP fired) to prevent
+        the remainder order from opening a brand-new unintended position.
+        """
+        if not self.remainder_order_id:
+            return
+        try:
+            logger.info(
+                f"🗑️ Cancelling remainder order {self.remainder_order_id} "
+                f"(position closed)"
+            )
+            GlobalRateLimiter.wait()
+            result = order_manager.cancel_order(self.remainder_order_id)
+            logger.info(f"Remainder cancel result: {result}")
+        except Exception as e:
+            logger.warning(f"Could not cancel remainder order: {e}")
+        finally:
+            self.remainder_order_id    = None
+            self.remainder_order_qty   = 0.0
+            self.remainder_order_price = 0.0
+
     def _on_position_closed(self, side: str, close_price: float, current_time: int) -> None:
         try:
             entry = self.initial_entry_price or close_price
@@ -5166,6 +5423,12 @@ class AdvancedICTStrategy:
             tp    = self.initial_tp_price or 0.0
             qty   = self.entry_quantity or (
                 self.active_position.get("quantity", 0) if self.active_position else 0)
+
+            # ── Cancel remainder order if still pending ──────────────────
+            # Position is closing — the remainder limit order must be cancelled
+            # immediately or it will open a brand-new unintended position.
+            if self.remainder_order_id and self._order_manager:
+                self._cancel_remainder_order(self._order_manager)
 
             # ── Try to get actual fill price from SL/TP orders ──────────
             actual_exit = close_price
@@ -5436,6 +5699,10 @@ class AdvancedICTStrategy:
         self.max_adverse_excursion   = 0.0
         self._trade_side             = None
         self._range_bound_active     = False
+        # Remainder order state
+        self.remainder_order_id      = None
+        self.remainder_order_qty     = 0.0
+        self.remainder_order_price   = 0.0
 
     def _cancel_pending_sl_tp(self, order_manager) -> None:
         """Cancel pre-placed SL and TP orders when entry is cancelled with no fill.
