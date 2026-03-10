@@ -266,6 +266,12 @@ class StructureEngine:
         self._registered_fvgs: set = set()
         self._registered_sweeps: set = set()
 
+        # OB visit tracking: keys of OBs that price is CURRENTLY inside.
+        # A new visit is counted only when price ENTERS a zone it was previously
+        # OUTSIDE of — not on every update cycle while price stays inside.
+        # Key format: (round(ob.low,1), round(ob.high,1), ob.direction)
+        self._ob_in_zone: set = set()
+
     # ==================================================================
     # PUBLIC: Full structure update
     # ==================================================================
@@ -853,13 +859,36 @@ class StructureEngine:
     # ==================================================================
 
     def _update_ob_visits(self, current_price: float, now_ms: int) -> None:
-        """Track how many times price has visited each OB."""
+        """
+        Track how many distinct times price has visited each OB.
+
+        A "visit" is counted when price ENTERS a zone it was previously
+        OUTSIDE of — not on every update cycle while price stays inside.
+        This means two rapid ticks inside the same OB count as ONE visit,
+        but leaving and returning later increments the counter correctly.
+
+        Uses self._ob_in_zone to track the currently-occupied set of OBs
+        across structure update cycles.
+        """
+        currently_in: set = set()
+
         for ob_list in [self.order_blocks_bull, self.order_blocks_bear]:
             for ob in ob_list:
-                if ob.is_active(now_ms) and ob.contains_price(current_price):
-                    # Only count visit if price moved away and came back
-                    # (simple: count once per structure update cycle)
-                    ob.visit_count = max(ob.visit_count, 1)
+                if not ob.is_active(now_ms):
+                    continue
+                ob_key = (round(ob.low, 1), round(ob.high, 1), ob.direction)
+                if ob.contains_price(current_price):
+                    currently_in.add(ob_key)
+                    # New entry: price just entered a zone it was NOT in last cycle
+                    if ob_key not in self._ob_in_zone:
+                        ob.visit_count += 1
+                        logger.debug(
+                            f"OB visit #{ob.visit_count}: "
+                            f"{ob.direction} ${ob.low:.1f}–${ob.high:.1f}"
+                        )
+
+        # Update the "in zone" tracking set for the next cycle
+        self._ob_in_zone = currently_in
 
     # ==================================================================
     # CLEANUP

@@ -866,11 +866,18 @@ class AdvancedICTStrategy:
                 disp = "+DISP" if p.displacement_confirmed else ""
                 logger.info(f"     ✅ SWEPT {p.pool_type} @ ${p.price:,.1f} {disp}")
 
-            # Nearest swings
-            highs_above = sorted([s for s in self.swing_highs if s.price > current_price],
-                                 key=lambda s: s.price)[:3]
-            lows_below = sorted([s for s in self.swing_lows if s.price < current_price],
-                                key=lambda s: s.price, reverse=True)[:3]
+            # Nearest swings — filter out prices that have already been swept.
+            # A swept EQH/EQL price is consumed; showing it as an active "high above"
+            # is misleading and was causing confusion in live session logs (Bug #2).
+            _swept_prices = {round(p.price, 1) for p in self.liquidity_pools if p.swept}
+            highs_above = sorted(
+                [s for s in self.swing_highs
+                 if s.price > current_price and round(s.price, 1) not in _swept_prices],
+                key=lambda s: s.price)[:3]
+            lows_below = sorted(
+                [s for s in self.swing_lows
+                 if s.price < current_price and round(s.price, 1) not in _swept_prices],
+                key=lambda s: s.price, reverse=True)[:3]
             if highs_above:
                 h_str = " | ".join(f"${s.price:,.1f}[{s.timeframe}]" for s in highs_above)
                 logger.info(f"   Highs above: {h_str}")
@@ -3372,7 +3379,7 @@ class AdvancedICTStrategy:
 
                 sl_dist_pct = (entry_price - sl_price) / entry_price
                 if sl_dist_pct > config.MAX_SL_DISTANCE_PCT:
-                    if not quiet: logger.warning(f"SL too wide: {sl_dist*100:.2f}% — rejecting")
+                    if not quiet: logger.warning(f"SL too wide: {sl_dist_pct*100:.2f}% — rejecting")
                     return None, None, None
 
                 risk = entry_price - sl_price
@@ -5113,11 +5120,30 @@ class AdvancedICTStrategy:
                         # Escalate to _replace_sl_order which has emergency fallback
                         self._replace_sl_order(order_manager, self.current_sl_price, side)
 
-                    # Cancel & re-place TP with remaining qty
+                    # Cancel & re-place TP with remaining qty.
+                    # IMPORTANT: check the cancel result — if ALREADY_FILLED, the TP
+                    # fired fully during our partial-reconcile window (race condition).
+                    # In that case the position is fully closed; do NOT re-place a new TP.
                     old_tp_id = self.tp_order_id
                     self.tp_order_id = None
                     GlobalRateLimiter.wait()
-                    cr = order_manager.cancel_order(old_tp_id)  # might already be gone
+                    cr = order_manager.cancel_order(old_tp_id)
+                    if cr in (CancelResult.ALREADY_FILLED, CancelResult.PARTIAL_FILL):
+                        logger.warning(
+                            f"⚠️ TP {old_tp_id} fully fired during partial-TP reconcile "
+                            f"(cancel → {cr.value}) — treating as position closed"
+                        )
+                        # SL was already re-placed above; cancel it now to avoid orphan
+                        if self.sl_order_id:
+                            try:
+                                GlobalRateLimiter.wait()
+                                order_manager.cancel_order(self.sl_order_id)
+                            except Exception:
+                                pass
+                            self.sl_order_id = None
+                        self._on_position_closed(
+                            side, self.current_tp_price or 0, int(time.time() * 1000))
+                        return
                     side_str = "long" if side == "long" else "short"
                     self._replace_tp_order(order_manager, self.current_tp_price,
                                            side_str, qty=remaining_qty)
@@ -5316,8 +5342,13 @@ class AdvancedICTStrategy:
                             f"qty={new_total_qty:.4f} BTC @ ${self.current_sl_price:,.2f}"
                         )
                     else:
+                        # Replace failed — old order was cancelled inside replace_stop_loss
+                        # but the new one wasn't placed.  Clear the stale ID so the
+                        # 60s health check detects "no SL" and places a fresh one.
+                        self.sl_order_id = None
                         logger.error(
-                            f"❌ SL replace failed after remainder fill: {new_sl}"
+                            f"❌ SL replace failed after remainder fill: {new_sl} — "
+                            f"sl_order_id cleared; health check will re-place"
                         )
 
                 # ── Replace TP with combined qty ──────────────────────────
@@ -5345,8 +5376,12 @@ class AdvancedICTStrategy:
                             f"qty={new_total_qty:.4f} BTC @ ${self.current_tp_price:,.2f}"
                         )
                     else:
+                        # Replace failed — old order was cancelled but new one wasn't placed.
+                        # Clear stale ID so health check / TP Guardian can detect and re-place.
+                        self.tp_order_id = None
                         logger.error(
-                            f"❌ TP replace failed after remainder fill: {new_tp}"
+                            f"❌ TP replace failed after remainder fill: {new_tp} — "
+                            f"tp_order_id cleared; health check / guardian will re-place"
                         )
 
                 send_telegram_message(
