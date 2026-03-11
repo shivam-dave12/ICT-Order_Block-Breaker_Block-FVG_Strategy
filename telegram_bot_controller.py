@@ -683,15 +683,13 @@ class TelegramBotController:
             return "No trades recorded yet."
 
         lines = ["<b>Recent Trades</b>\n"]
-        # deque doesn't support slicing — convert to list first
-        recent = list(history)[-5:]
-        for trade in recent:
-            # TradeRecord is a dataclass, use getattr not .get()
-            side   = getattr(trade, "side", "?").upper()
-            pnl    = getattr(trade, "pnl", 0)
-            reason = getattr(trade, "reason", "?")
-            icon   = "✅" if pnl >= 0 else "❌"
-            lines.append(f"  {icon} {side} P&L: ${pnl:+,.2f} [{reason}]")
+        for trade in history[-5:]:
+            side = trade.get("side", "?").upper()
+            pnl = trade.get("net_pnl", 0)
+            rr = trade.get("rr_achieved", 0)
+            reason = trade.get("exit_reason", "?")
+            icon = "" if pnl >= 0 else ""
+            lines.append(f"  {icon} {side} P&L: ${pnl:+,.2f} ({rr:+.1f}R) [{reason}]")
 
         stats = bot_instance.strategy.get_strategy_stats() if bot_instance.strategy else {}
         lines.append(f"\nTotal: {stats.get('total_exits', 0)} trades")
