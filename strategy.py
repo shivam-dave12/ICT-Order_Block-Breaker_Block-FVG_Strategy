@@ -18,6 +18,7 @@ NO FALLBACKS. NO SYNTHETIC DATA. EVERYTHING FROM LIVE MARKET STRUCTURE.
 """
 
 import time
+import math
 import logging
 import threading
 from typing import List, Dict, Optional, Tuple
@@ -426,6 +427,12 @@ class AdvancedICTStrategy:
         self._last_sl_health_check     = 0
         self._last_pos_check_time      = 0      # throttle _check_position_closed
         self._POS_CHECK_INTERVAL_SEC   = 5.0    # check every 5s, not every 250ms tick
+
+        # ── Consecutive timeout tracking ─────────────────────────────────
+        # Prevents the bot from endlessly retrying the same unfillable limit
+        # order for hours (e.g. FVG midpoint $250 below market).
+        self._consecutive_timeout_count: int   = 0
+        self._last_timeout_entry_price: float  = 0.0
 
         # SL/TP health check consecutive-unknown counters (init here, not via hasattr)
         self._sl_unknown_count: int    = 0
@@ -3361,6 +3368,20 @@ class AdvancedICTStrategy:
                 # Small offset for fill probability
                 entry_price -= entry_offset
 
+                # ── SNIPER DISTANCE CAP ────────────────────────────────────
+                # If sniper entry is > SNIPER_MAX_DISTANCE_ATR × ATR below
+                # current price, cap it.  Prevents unfillable limits placed
+                # at wide FVG midpoints $200-500 below market that timeout
+                # repeatedly for hours.
+                max_sniper_dist = atr * getattr(config, "SNIPER_MAX_DISTANCE_ATR", 1.0)
+                if current_price - entry_price > max_sniper_dist:
+                    entry_price = current_price - min(max_sniper_dist, entry_offset * 3)
+                    if not quiet:
+                        logger.info(
+                            f"📐 Sniper capped: FVG/OB midpoint too far, "
+                            f"entry moved to ${entry_price:,.1f} (max {max_sniper_dist:.0f} from market)"
+                        )
+
                 # SL: Below triggering OB low, or below nearest swing low
                 sl_price = None
                 if ctx.trigger_ob is not None:
@@ -3388,6 +3409,23 @@ class AdvancedICTStrategy:
                 if sl_dist_pct > config.MAX_SL_DISTANCE_PCT:
                     if not quiet: logger.warning(f"SL too wide: {sl_dist_pct*100:.2f}% — rejecting")
                     return None, None, None
+
+                # ── MARKET-FILL SL VALIDATION ──────────────────────────────
+                # If entry_price > current_price, the limit buy fills IMMEDIATELY
+                # at ~current_price (not at entry_price).  The effective SL distance
+                # from the actual fill is current_price - sl_price, which may be
+                # much less than entry_price - sl_price.  Reject if the effective
+                # distance is < 1.0 ATR — the trade would be stopped by noise.
+                if entry_price > current_price and atr > 0:
+                    effective_sl_dist = current_price - sl_price
+                    if effective_sl_dist < atr * 1.0:
+                        if not quiet:
+                            logger.warning(
+                                f"⚠️ LONG entry above market (${entry_price:,.0f} > ${current_price:,.0f}) "
+                                f"— effective SL dist ${effective_sl_dist:,.0f} < 1.0×ATR(${atr:,.0f}) "
+                                f"— rejecting (would be stopped by noise)"
+                            )
+                        return None, None, None
 
                 risk = entry_price - sl_price
 
@@ -3489,6 +3527,16 @@ class AdvancedICTStrategy:
                     entry_price = ctx.trigger_fvg.midpoint
                 entry_price += entry_offset
 
+                # ── SNIPER DISTANCE CAP (SHORT mirror) ─────────────────────
+                max_sniper_dist = atr * getattr(config, "SNIPER_MAX_DISTANCE_ATR", 1.0)
+                if entry_price - current_price > max_sniper_dist:
+                    entry_price = current_price + min(max_sniper_dist, entry_offset * 3)
+                    if not quiet:
+                        logger.info(
+                            f"📐 Sniper capped: FVG/OB midpoint too far, "
+                            f"entry moved to ${entry_price:,.1f} (max {max_sniper_dist:.0f} from market)"
+                        )
+
                 # SL above triggering OB high, or above nearest swing high
                 sl_price = None
                 if ctx.trigger_ob is not None:
@@ -3515,6 +3563,18 @@ class AdvancedICTStrategy:
                 if sl_dist_pct > config.MAX_SL_DISTANCE_PCT:
                     if not quiet: logger.warning(f"SL too wide: {sl_dist_pct*100:.2f}% — rejecting")
                     return None, None, None
+
+                # ── MARKET-FILL SL VALIDATION (SHORT mirror) ───────────────
+                if entry_price < current_price and atr > 0:
+                    effective_sl_dist = sl_price - current_price
+                    if effective_sl_dist < atr * 1.0:
+                        if not quiet:
+                            logger.warning(
+                                f"⚠️ SHORT entry below market (${entry_price:,.0f} < ${current_price:,.0f}) "
+                                f"— effective SL dist ${effective_sl_dist:,.0f} < 1.0×ATR(${atr:,.0f}) "
+                                f"— rejecting (would be stopped by noise)"
+                            )
+                        return None, None, None
 
                 risk = sl_price - entry_price
 
@@ -3798,6 +3858,21 @@ class AdvancedICTStrategy:
             position_size = max(config.MIN_POSITION_SIZE,
                                min(position_size, config.MAX_POSITION_SIZE))
 
+            # ── Round DOWN to exchange lot step (0.001 BTC) ────────────────
+            # CoinSwitch fills in LOT_STEP_SIZE increments. Ordering 0.0059
+            # fills 0.005, leaving 0.0009 unfilled — below exchange minimum
+            # for a remainder order.  Rounding DOWN eliminates partial fills.
+            lot_step = getattr(config, "LOT_STEP_SIZE", 0.001)
+            position_size = math.floor(position_size / lot_step) * lot_step
+            position_size = round(position_size, 4)  # clean float
+
+            if position_size < config.MIN_POSITION_SIZE:
+                logger.warning(
+                    f"⚠️ Position size {position_size} BTC below minimum after "
+                    f"lot rounding — skipping entry"
+                )
+                return
+
             # Place limit entry order
             GlobalRateLimiter.wait()
             entry_side = "BUY" if side == "long" else "SELL"
@@ -3985,8 +4060,41 @@ class AdvancedICTStrategy:
 
                 # SUCCESS or NOT_FOUND — order cleanly cancelled or gone
                 self._cancel_pending_sl_tp(order_manager)   # IDs still valid here
+
+                # ── CONSECUTIVE TIMEOUT TRACKING ──────────────────────────
+                # If the bot keeps timing out at the same price (unfillable limit
+                # at a far FVG/OB midpoint), apply an extended lockout instead of
+                # the normal 60s.  Prevents 4+ hour retry loops.
+                entry_p = self.initial_entry_price or 0
+                _price_tolerance = entry_p * 0.001 if entry_p > 0 else 10.0  # 0.1% tolerance
+                if (self._last_timeout_entry_price > 0 and
+                        abs(entry_p - self._last_timeout_entry_price) <= _price_tolerance):
+                    self._consecutive_timeout_count += 1
+                else:
+                    self._consecutive_timeout_count = 1
+
+                self._last_timeout_entry_price = entry_p
+
+                max_timeouts = getattr(config, "MAX_CONSECUTIVE_TIMEOUTS", 2)
+                if self._consecutive_timeout_count >= max_timeouts:
+                    lockout_ms = getattr(config, "TIMEOUT_EXTENDED_LOCKOUT_SEC", 1800) * 1000
+                    self._placement_locked_until = current_time + lockout_ms
+                    logger.warning(
+                        f"⛔ {self._consecutive_timeout_count} consecutive timeouts "
+                        f"at ${entry_p:,.1f} — extended lockout "
+                        f"{lockout_ms // 60_000}m to avoid retry loop"
+                    )
+                    send_telegram_message(
+                        f"⛔ <b>Repeated Timeout Lockout</b>\n"
+                        f"{self._consecutive_timeout_count}× timeout at ${entry_p:,.1f}\n"
+                        f"Setup unfillable — locked out {lockout_ms // 60_000}m"
+                    )
+                    self._consecutive_timeout_count = 0
+                    self._last_timeout_entry_price = 0
+                else:
+                    self._placement_locked_until = current_time + PLACEMENT_LOCK_SECONDS * 1000
+
                 self._reset_position_state()                # now safe to zero everything
-                self._placement_locked_until = current_time + PLACEMENT_LOCK_SECONDS * 1000
                 return
 
             # Check order status
@@ -4022,6 +4130,10 @@ class AdvancedICTStrategy:
         cancel and re-place with the correct qty.
         """
         try:
+            # ── Reset consecutive timeout counter (successful fill) ────────
+            self._consecutive_timeout_count = 0
+            self._last_timeout_entry_price = 0.0
+
             side = (
                 self._trade_side.upper()
                 if getattr(self, "_trade_side", None)
@@ -4194,12 +4306,12 @@ class AdvancedICTStrategy:
             _QTY_TOL = 0.0001
             if abs(actual_qty - pre_placed_qty) > _QTY_TOL:
                 _remainder_qty = round(pre_placed_qty - actual_qty, 4)
-                # Use REMAINDER_MIN_QTY (exchange minimum, e.g. 0.0001 BTC)
+                # Use REMAINDER_MIN_QTY (CoinSwitch minimum = 0.001 BTC)
                 # NOT MIN_POSITION_SIZE (0.001) — remainder orders are additive
                 # to an already-open position, so the normal entry minimum
                 # doesn't apply.  Placing the remainder ensures the full
                 # intended position size is achieved.
-                _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.0001)
+                _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.001)
                 if _remainder_qty >= _rem_min:
                     logger.info(
                         f"📐 Partial fill detected — placing remainder order: "
@@ -5462,7 +5574,7 @@ class AdvancedICTStrategy:
                     # Still partially pending — keep monitoring same order ID
                     self.remainder_order_qty = round(
                         self.remainder_order_qty - incremental_fill, 4)
-                    _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.0001)
+                    _rem_min = getattr(config, "REMAINDER_MIN_QTY", 0.001)
                     if self.remainder_order_qty >= _rem_min:
                         logger.info(
                             f"📐 Remainder order still partially open: "

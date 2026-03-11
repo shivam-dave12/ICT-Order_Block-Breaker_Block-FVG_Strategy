@@ -41,9 +41,10 @@ MIN_MARGIN_PER_TRADE     = 4        # USDT minimum margin
 MAX_MARGIN_PER_TRADE     = 10_000   # USDT maximum margin
 MIN_POSITION_SIZE        = 0.001    # BTC minimum
 MAX_POSITION_SIZE        = 1.0      # BTC maximum
-REMAINDER_MIN_QTY        = 0.0001   # BTC — exchange minimum for remainder limit orders
-                                     # Lower than MIN_POSITION_SIZE so partial fills
-                                     # can place remainder orders for small unfilled qty
+LOT_STEP_SIZE            = 0.001    # BTC — CoinSwitch fills in 0.001 BTC increments
+                                     # Position qty MUST be rounded DOWN to this step
+                                     # to prevent partial fills with unfillable remainders
+REMAINDER_MIN_QTY        = 0.001    # BTC — CoinSwitch rejects limit orders < 0.001
 
 
 # ─────────────────────────────────────────────
@@ -252,6 +253,14 @@ TICK_SIZE                = 0.1
 LIMIT_ORDER_OFFSET_TICKS = 5
 ORDER_TIMEOUT_SECONDS    = 600   # also controls entry-pending cancel (see ENTRY_PENDING_TIMEOUT_SECONDS)
 MAX_ORDER_RETRIES        = 2
+MAX_CONSECUTIVE_TIMEOUTS = 2     # after N timeouts at same level, block for extended cooldown
+TIMEOUT_EXTENDED_LOCKOUT_SEC = 1800   # 30 min lockout after repeated timeouts
+
+# ── Sniper entry distance cap ──
+# When FVG/OB midpoint is > this many ATR multiples from current price,
+# fall back to current_price with a small offset.  Prevents unfillable
+# limit orders that sit 200-500$ below market and timeout endlessly.
+SNIPER_MAX_DISTANCE_ATR  = 1.0   # max 1 ATR from current price for limit entry
 
 
 # ─────────────────────────────────────────────
