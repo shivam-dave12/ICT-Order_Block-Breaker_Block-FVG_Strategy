@@ -324,7 +324,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),
@@ -380,7 +380,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),
@@ -435,7 +435,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),
@@ -490,7 +490,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),
@@ -546,7 +546,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),
@@ -601,7 +601,7 @@ class ICTDataManager:
             for k in sorted(data, key=lambda x: int(x.get("close_time") or x.get("start_time") or 0)):
                 try:
                     candle = Candle(
-                        timestamp=float(k.get("close_time") or k.get("start_time") or 0) / 1000.0,
+                        timestamp=float(k.get("start_time") or k.get("close_time") or 0) / 1000.0,
                         open=float(k.get("o") or k.get("open") or 0),
                         high=float(k.get("h") or k.get("high") or 0),
                         low=float(k.get("l") or k.get("low") or 0),

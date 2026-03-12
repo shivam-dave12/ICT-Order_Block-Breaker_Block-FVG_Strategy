@@ -301,7 +301,12 @@ class RiskManager:
                     config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
-            # ── Loss cooldown (new) ───────────────────────────────────────────
+            # ── Post-loss cooldown ────────────────────────────────────────────
+            # This check requires TRADE_COOLDOWN_SECONDS > MIN_TIME_BETWEEN_TRADES*60
+            # to have any effect (otherwise the general cooldown above already
+            # covers the same window). With config defaults of both = 600s the
+            # checks are equivalent; set TRADE_COOLDOWN_SECONDS > 600 to enforce
+            # a longer pause specifically after losing trades.
             cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 300)
             if (self.consecutive_losses > 0 and
                     self.last_trade_time > 0 and

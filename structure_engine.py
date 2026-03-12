@@ -285,6 +285,18 @@ class StructureEngine:
         # Rebuild dedup sets from current deque contents before detection.
         # This ensures keys are always in sync with live deque state —
         # no stale keys from cleanup removals or deque maxlen evictions.
+        #
+        # CRITICAL: _registered_mss MUST be rebuilt here alongside obs/fvgs.
+        # market_structures has maxlen=150 — as old MSS events are evicted, their
+        # keys would otherwise stay in _registered_mss forever, permanently
+        # blocking re-detection of the same price level in a future session.
+        # Example: a $70,077 BOS from the morning session prevents detection of
+        # a new BOS at $70,077 in the afternoon even after the morning event
+        # has been evicted from the deque. Rebuilding each cycle fixes this.
+        self._registered_mss = {
+            (round(ms.price, 1), ms.direction, ms.timeframe)
+            for ms in self.market_structures
+        }
         self._registered_obs = {
             (round(ob.low, 1), round(ob.high, 1), ob.direction, ob.timeframe)
             for ob_list in [self.order_blocks_bull, self.order_blocks_bear]
@@ -498,10 +510,18 @@ class StructureEngine:
             new_state = TrendState.TRANSITIONING
         self._trend_state[tf] = new_state
 
-        # Now check if the LATEST candle breaks any critical swing
-        if not candles:
+        # Use the last CONFIRMED CLOSED candle for structure break detection.
+        # candles[-1] is the currently forming (open) candle whose close price
+        # changes tick-by-tick. Detecting a BOS/CHoCH on it causes two bugs:
+        #   1. A BOS is registered mid-candle if price momentarily exceeds the
+        #      swing level, then the candle closes back below it — a false signal.
+        #   2. The mss_key dedup entry is written for the false break, permanently
+        #      blocking re-detection when the level is legitimately broken later.
+        # Fix: always use candles[-2] (last closed candle). If there are fewer
+        # than 2 candles (impossible at this point but guarded defensively), bail.
+        if len(candles) < 2:
             return
-        last_candle = candles[-1]
+        last_candle = candles[-2]   # last CLOSED candle — never the forming one
         last_close = float(last_candle['c'])
         last_open = float(last_candle['o'])
         last_high = float(last_candle['h'])
