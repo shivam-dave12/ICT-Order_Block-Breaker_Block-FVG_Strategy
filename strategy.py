@@ -3103,15 +3103,55 @@ class AdvancedICTStrategy:
         now_ms: int,
     ) -> Tuple[float, List[str], "TriggerContext", dict]:
         """
-        Institutional Narrative Completeness Score.
+        Institutional Narrative Completeness Score — v12.
 
         Five components — scored not gated:
 
-          A. Catalyst   (0-35)  WHY will price move? (sweep, displacement, BOS)
-          B. Structure  (0-25)  HOW confirmed? (MSS type, TF, freshness)
-          C. Context    (0-25)  IS bigger picture aligned? (HTF, regime, DR)
-          D. Entry      (0-15)  WHERE are we entering? (OB/FVG — pure bonus)
-          E. Micro      (0-12)  DO order-flow signals confirm? (CVD, absorption)
+          A. Catalyst   (0-35)  WHY will price move?
+                                ICT sequence: sweep → displacement → MSS.
+                                AMD Manipulation phase adds +5 (Power of 3 fake
+                                sweep IS the catalyst, not a micro confirmation).
+                                Killzone timing adds +4 (London/NY open sweeps
+                                carry institutional edge vs off-hours noise).
+                                Both are additive on catalyst_raw before freshness
+                                decay, capped at 35 — they amplify weak catalysts,
+                                not perfect ones.
+
+          B. Structure  (0-25)  CONVICTION DEPTH — deliberately non-overlapping
+                                with Component A (which already scores the MSS).
+                                  B1. Multi-TF alignment   (0-12): Is the trigger
+                                      MSS confirmed by a higher-TF MSS within 3h?
+                                      A 5m CHoCH confirmed by a 1h CHoCH is a
+                                      fundamentally different signal than a lone
+                                      5m event.
+                                  B2. BOS→CHoCH sequence   (0-8):  Was a trend
+                                      already established (BOS) before the CHoCH
+                                      flipped it?  ICT's highest-quality CHoCH
+                                      appears after a clear BOS chain.
+                                  B3. Sweep-to-MSS speed   (0-5):  Institutional
+                                      response is fast (≤5 min).  Slow confirmation
+                                      (30+ min) = algos/retail catching up, not
+                                      institutional intent.
+
+          C. Context    (0-25)  IS bigger picture aligned?
+                                HTF bias + regime + daily + DR zone +
+                                TARGET LIQUIDITY COUNT: unswept EQH/EQL pools
+                                in the TP direction give price magnetic pull.
+                                More pools = better TP probability (+1-3 pts).
+
+          D. Entry      (0-15)  WHERE are we entering?
+                                OB/FVG zone quality (virgin multiplier from
+                                OrderBlock.virgin_multiplier() — no override).
+                                SWEEP-ZONE PROXIMITY BONUS (+0-4): When the
+                                entry zone sits AT the swept liquidity level
+                                (ICT "mitigation block"), the institutional
+                                footprint is maximally concentrated here.
+
+          E. Micro      (0-12)  DO order-flow signals confirm?
+                                CVD, absorption.
+                                SESSION TIMING (+2-4): KZ = +4, London/NY
+                                session = +2.  Replaces the empty log-only
+                                killzone note that added zero points.
 
         Hard minimums enforced by caller:
           • catalyst >= 10   → BLOCKED_NO_NARRATIVE
@@ -3124,11 +3164,10 @@ class AdvancedICTStrategy:
             ctx = TriggerContext()
             rs  = self.regime_engine.state
 
-            target_dir   = "bullish" if side == "long" else "bearish"
-            against_dir  = "bearish" if side == "long" else "bullish"
-            is_retrace   = self._is_retracement_trade(side)
+            target_dir  = "bullish" if side == "long" else "bearish"
+            is_retrace  = self._is_retracement_trade(side)
 
-            # ── Collect nearest swing context (used by SL/TP calculation) ─
+            # ── Collect nearest swing context (SL/TP derivation) ─────────────
             if side == "long":
                 lows_b  = [s.price for s in list(self.swing_lows)[-10:]  if s.price < current_price]
                 highs_a = [s.price for s in list(self.swing_highs)[-10:] if s.price > current_price]
@@ -3140,20 +3179,14 @@ class AdvancedICTStrategy:
                 ctx.nearest_swing_high = min(highs_a) if highs_a else None
                 ctx.nearest_swing_low  = max(lows_b)  if lows_b  else None
 
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             # A. NARRATIVE CATALYST  (0 – 35)
-            # ══════════════════════════════════════════════════════════════
-            #
-            # Sweep + displacement + MSS is the complete ICT narrative.
-            # Without a catalyst, everything else is just pattern reading.
-            #
+            # ══════════════════════════════════════════════════════════════════
             catalyst_raw  = 0.0
             catalyst_note = "no catalyst"
             sweep_age_min = 999.0
 
             sweep_age_limit = config.SWEEP_MAX_AGE_MINUTES * 60_000
-
-            # Find most recent valid directional sweep
             pool_type = "EQL" if side == "long" else "EQH"
             sweep_pool: Optional["LiquidityPool"] = None
             for pool in reversed(list(self.liquidity_pools)):
@@ -3171,9 +3204,8 @@ class AdvancedICTStrategy:
             has_disp  = sweep_pool.displacement_confirmed if has_sweep else False
             has_wick  = sweep_pool.wick_rejection         if has_sweep else False
 
-            # Find most recent directional MSS (CHoCH or BOS)
+            # MSS search
             mss_max_age = config.MSS_MAX_AGE_MINUTES * 60_000
-            # In trending/accumulation, extend the window
             trending = rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
                                      REGIME_TRENDING_BEAR, REGIME_DISTRIBUTION)
             if trending:
@@ -3186,14 +3218,13 @@ class AdvancedICTStrategy:
                     break
                 if ms.direction != target_dir:
                     continue
-                # In trending regimes accept MSS that slightly predates sweep
                 if has_sweep:
                     pre_ms = sweep_pool.sweep_timestamp - ms.timestamp
                     if ms.timestamp < sweep_pool.sweep_timestamp:
                         if trending and pre_ms <= 60 * 60 * 1000:
-                            pass  # allow
+                            pass  # allow pre-sweep MSS in trending regime
                         else:
-                            continue  # predates sweep — skip in non-trending
+                            continue
                 mss_event = ms
                 ctx.mss_event = ms
                 break
@@ -3204,16 +3235,14 @@ class AdvancedICTStrategy:
                 mss_event.timestamp >= sweep_pool.sweep_timestamp
             )
 
+            # ── ICT sequence scoring ──────────────────────────────────────────
             if is_retrace:
-                # Retracement: displacement itself IS the catalyst
                 catalyst_raw  = 22.0
                 catalyst_note = f"RETRACE after {self._displacement_direction.upper()} disp"
                 if has_mss:
                     catalyst_raw  = 30.0
                     catalyst_note += " + MSS"
-
             elif has_sweep and has_disp and has_wick and (has_mss and mss_post_sweep):
-                # Full sequence — highest quality
                 catalyst_raw  = 35.0
                 catalyst_note = f"sweep+disp+wick+MSS_{mss_event.structure_type}"
             elif has_sweep and has_disp and (has_mss and mss_post_sweep):
@@ -3232,8 +3261,7 @@ class AdvancedICTStrategy:
                 catalyst_raw  = 10.0
                 catalyst_note = "sweep only (no displacement)"
             else:
-                # No sweep — check for a high-TF BOS (continuation without pool sweep)
-                # e.g. trending move where liq pools aren't cleanly swept
+                # No sweep — check for HTF BOS (trending continuation)
                 for ms in reversed(list(self.market_structures)):
                     if (now_ms - ms.timestamp) > mss_max_age:
                         break
@@ -3247,8 +3275,28 @@ class AdvancedICTStrategy:
                         has_mss = True
                         break
 
-            # Freshness decay: full value ≤30 min, decays to 50% by 120 min.
-            # Uses sweep age if a sweep exists; MSS age for the HTF BOS path.
+            # ── Timing bonuses (additive on catalyst_raw, capped at 35) ──────
+            # AMD MANIPULATION (Power of 3): the fake sweep in the manipulation
+            # phase IS the catalyst.  +5 pts raises a sweep+disp (21) toward
+            # sweep+disp+wick quality (26).  Already-maxed setups are unaffected.
+            # Killzone (London/NY open): institutional windows carry real edge.
+            # +4 pts reflects that a killzone sweep is more reliable than the
+            # same pattern at 3am UTC.  Both are capped — they promote weak
+            # setups, not inflate already-perfect ones.
+            if not is_retrace:
+                if self.amd_phase == "MANIPULATION" and has_sweep:
+                    amd_bonus = min(5.0, 35.0 - catalyst_raw)
+                    catalyst_raw += amd_bonus
+                    reasons.append(f"AMD Manipulation +{amd_bonus:.0f} catalyst")
+                if self.in_killzone and has_sweep:
+                    kz_label = getattr(self, "_active_kz_name", self.current_session)
+                    kz_bonus = min(4.0, 35.0 - catalyst_raw)
+                    catalyst_raw += kz_bonus
+                    reasons.append(f"KZ {kz_label} +{kz_bonus:.0f} catalyst")
+                catalyst_raw = min(catalyst_raw, 35.0)
+
+            # ── Freshness decay ───────────────────────────────────────────────
+            # Full value ≤30 min, decays linearly to 50% by 210 min.
             if catalyst_raw > 0 and not is_retrace:
                 if has_sweep:
                     age_for_decay = sweep_age_min
@@ -3261,86 +3309,158 @@ class AdvancedICTStrategy:
             else:
                 catalyst_score = catalyst_raw
 
-            # Sweep scoring for TriggerContext (same as old section 2)
             if has_sweep and has_disp:
-                sw_label = f"sweep {pool_type}@{sweep_pool.price:.0f}"
-                sw_pts   = round(catalyst_raw * 0.65, 1)   # subset of catalyst
-                reasons.append(f"{sw_label} +{sw_pts}")
+                sw_pts = round(catalyst_score * 0.65, 1)
+                reasons.append(f"sweep {pool_type}@{sweep_pool.price:.0f} +{sw_pts}")
             if catalyst_note != "no catalyst":
                 reasons.append(f"Catalyst [{catalyst_note}] +{catalyst_score:.1f}")
 
-            # ══════════════════════════════════════════════════════════════
-            # B. STRUCTURAL QUALITY  (0 – 25)
-            # ══════════════════════════════════════════════════════════════
-            #
-            # Measures how clearly the market has declared directional intent.
-            # Higher TF and fresher MSS score more.
-            #
+            # ══════════════════════════════════════════════════════════════════
+            # B. STRUCTURAL CONVICTION  (0 – 25)
+            # ══════════════════════════════════════════════════════════════════
+            # Deliberately non-overlapping with Component A.
+            # A scores WHAT happened (event sequence).
+            # B scores HOW MUCH MARKET CONVICTION supports it:
+            #   B1. Multi-TF alignment   (0-12)
+            #   B2. BOS→CHoCH sequence   (0-8)
+            #   B3. Sweep-to-MSS speed   (0-5)
             structure_score = 0.0
+
             if has_mss and mss_event is not None:
-                tf_weight = {"1h": 1.15, "4h": 1.20, "15m": 1.00, "5m": 0.80}.get(
-                    mss_event.timeframe, 0.85)
-                base = 22.0 if mss_event.structure_type == "CHoCH" else 14.0
-                structure_score = base * tf_weight
 
-                # Age decay: -1 pt per 10 min after first 15 min
-                mss_age_min = (now_ms - mss_event.timestamp) / 60_000
-                structure_score = max(0.0, structure_score - max(0.0, (mss_age_min - 15.0) / 10.0))
-                structure_score = min(structure_score, 25.0)
+                # ── B1. Multi-TF alignment ────────────────────────────────────
+                # Base points by trigger MSS timeframe; bonus for a confirming
+                # MSS on a higher TF (same direction, within 3h).
+                tf_base = {"5m": 4, "15m": 6, "1h": 9, "4h": 11}.get(
+                    mss_event.timeframe, 4)
+                # CHoCH > BOS: trend-change signal carries more conviction
+                choch_base_bonus = 2 if mss_event.structure_type == "CHoCH" else 0
 
+                htf_tfs_map = {
+                    "5m":  ("15m", "1h"),
+                    "15m": ("1h", "4h"),
+                    "1h":  ("4h",),
+                    "4h":  (),
+                }
+                htf_confirm_tfs = htf_tfs_map.get(mss_event.timeframe, ())
+                htf_confirm_ms  = 3 * 3600 * 1000   # 3-hour window
+                htf_bonus = 0
+                for ms in reversed(list(self.market_structures)):
+                    if (now_ms - ms.timestamp) > htf_confirm_ms:
+                        break
+                    if ms.direction != target_dir:
+                        continue
+                    if ms.timeframe in htf_confirm_tfs:
+                        # Primary higher TF = full bonus; secondary = -1
+                        bonus_base = 3 if ms.timeframe == htf_confirm_tfs[0] else 2
+                        htf_bonus  = min(bonus_base + (1 if ms.structure_type == "CHoCH" else 0), 4)
+                        reasons.append(
+                            f"HTF confirm {ms.structure_type}[{ms.timeframe}] +{htf_bonus}")
+                        break
+
+                b1 = min(tf_base + choch_base_bonus + htf_bonus, 12)
+                structure_score += b1
                 reasons.append(
-                    f"{mss_event.structure_type} {target_dir} [{mss_event.timeframe}] "
-                    f"+{structure_score:.1f}"
+                    f"{mss_event.structure_type}[{mss_event.timeframe}] "
+                    f"tf={tf_base} choch={choch_base_bonus} htf={htf_bonus} +{b1}"
                 )
 
-            # ══════════════════════════════════════════════════════════════
+                # ── B2. BOS→CHoCH sequential confirmation ─────────────────────
+                # ICT: best CHoCH appears AFTER an established BOS chain.
+                # Standalone CHoCH from nowhere is a weaker signal.
+                # For BOS-based entries: reward consecutive BOS streak.
+                b2 = 0
+                prior_window_ms = 6 * 3600 * 1000
+                if mss_event.structure_type == "CHoCH":
+                    # Check for a prior BOS in the same direction within 6h
+                    prior_bos_found = False
+                    for ms in reversed(list(self.market_structures)):
+                        if ms is mss_event:
+                            continue
+                        if (now_ms - ms.timestamp) > prior_window_ms:
+                            break
+                        if ms.direction == target_dir and ms.structure_type == "BOS":
+                            prior_bos_found = True
+                            break
+                    if prior_bos_found:
+                        b2 = 8
+                        reasons.append("BOS→CHoCH sequence +8")
+                    else:
+                        # No prior BOS, but multiple recent same-direction MSS = partial conviction
+                        recent_same = sum(
+                            1 for ms in list(self.market_structures)[-20:]
+                            if ms.direction == target_dir and
+                            (now_ms - ms.timestamp) < 2 * 3600 * 1000
+                        )
+                        if recent_same >= 2:
+                            b2 = 4
+                            reasons.append(f"CHoCH +{recent_same} MSS confirm +4")
+                else:  # BOS-based catalyst
+                    recent_bos = sum(
+                        1 for ms in list(self.market_structures)[-15:]
+                        if ms.direction == target_dir and ms.structure_type == "BOS" and
+                        (now_ms - ms.timestamp) < 2 * 3600 * 1000
+                    )
+                    b2 = min(recent_bos * 2, 6)
+                    if b2 > 0:
+                        reasons.append(f"BOS streak ×{recent_bos} +{b2}")
+                structure_score += b2
+
+                # ── B3. Sweep-to-MSS speed ────────────────────────────────────
+                # Fast confirmation = institutional. Slow = retail catch-up.
+                # Only scored when MSS confirmed AFTER the sweep.
+                b3 = 0
+                if has_sweep and mss_post_sweep:
+                    lag_min = (mss_event.timestamp - sweep_pool.sweep_timestamp) / 60_000
+                    if lag_min <= 5:
+                        b3 = 5; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤5) +5")
+                    elif lag_min <= 15:
+                        b3 = 4; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤15) +4")
+                    elif lag_min <= 30:
+                        b3 = 2; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤30) +2")
+                    # >30 min lag: no speed bonus — institutional window has passed
+                structure_score += b3
+
+                structure_score = min(structure_score, 25.0)
+
+            # ══════════════════════════════════════════════════════════════════
             # C. CONTEXTUAL ALIGNMENT  (0 – 25, minimum 15 required)
-            # ══════════════════════════════════════════════════════════════
-            #
-            # Is the bigger picture pointing the same way?
-            # HTF bias scaled by strength + regime + daily + DR zone.
-            #
+            # ══════════════════════════════════════════════════════════════════
             context_score = 0.0
 
-            # HTF alignment (0–20)
+            # HTF alignment (0-20)
             if (side == "long"  and self.htf_bias == "BULLISH") or \
                (side == "short" and self.htf_bias == "BEARISH"):
-                htf_pts = 10.0 + 10.0 * self.htf_bias_strength   # 10–20
-                # Bias conflict penalty: HTF bullish but daily bearish = -3
+                htf_pts = 10.0 + 10.0 * self.htf_bias_strength
                 if side == "long"  and self.daily_bias == "BEARISH":
                     htf_pts = max(0.0, htf_pts - 3.0)
                 elif side == "short" and self.daily_bias == "BULLISH":
                     htf_pts = max(0.0, htf_pts - 3.0)
                 context_score += htf_pts
                 reasons.append(
-                    f"HTF {self.htf_bias} str={self.htf_bias_strength:.0%} +{htf_pts:.1f}"
-                )
+                    f"HTF {self.htf_bias} str={self.htf_bias_strength:.0%} +{htf_pts:.1f}")
             elif is_retrace:
-                # Retracement: neutral or opposing HTF still ok, get partial credit
                 retrace_pts = 8.0 + 6.0 * self.htf_bias_strength
                 context_score += retrace_pts
                 reasons.append(f"RETRACE partial HTF +{retrace_pts:.1f}")
 
-            # Regime alignment note — the threshold modifier already rewards/penalises
-            # trending vs volatile regimes.  Here we only add a small bonus for
-            # counter-regime trades (warn) or deeply aligned regimes (confirm).
+            # Regime alignment penalty for counter-trend trades
             if trending:
                 aligned = (
                     (rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL) and side == "long") or
                     (rs.regime in (REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR) and side == "short")
                 )
                 if not aligned:
-                    # Counter-regime trade: warn via context penalty
                     context_score -= 4.0
                     reasons.append(f"Regime {rs.regime} counter-direction -4")
 
-            # Daily bias alignment (+2)
+            # Daily bias (+2)
             if (side == "long"  and self.daily_bias == "BULLISH") or \
                (side == "short" and self.daily_bias == "BEARISH"):
                 context_score += 2.0
                 reasons.append("Daily bias aligned +2")
 
-            # Daily DR zone (−8 to +5)
+            # DR zone (−8 to +5)
             dr = self._ndr.best_dr()
             if dr is not None:
                 dz = dr.zone_pct(current_price)
@@ -3369,15 +3489,38 @@ class AdvancedICTStrategy:
                         context_score -= 4.0
                         reasons.append(f"DR discount {dz*100:.0f}% -4")
 
+            # ── Target liquidity pool count (+0-3) ───────────────────────────
+            # Unswept pools on the TARGET side act as magnetic price targets.
+            # More intact pools = stronger directional pull = better TP
+            # probability.  Pools within 3% of price are actionable.
+            # For LONG: unswept EQH above (price drawn toward equal highs).
+            # For SHORT: unswept EQL below (price drawn toward equal lows).
+            target_pool_type = "EQH" if side == "long" else "EQL"
+            liq_target_count = sum(
+                1 for p in self.liquidity_pools
+                if not p.swept
+                and p.pool_type == target_pool_type
+                and (
+                    (side == "long"  and p.price > current_price * 0.999) or
+                    (side == "short" and p.price < current_price * 1.001)
+                )
+                and abs(p.price - current_price) / current_price <= 0.03
+            )
+            if liq_target_count >= 3:
+                context_score += 3.0
+                reasons.append(f"Target liq {liq_target_count} pools +3")
+            elif liq_target_count == 2:
+                context_score += 2.0
+                reasons.append(f"Target liq 2 pools +2")
+            elif liq_target_count == 1:
+                context_score += 1.0
+                reasons.append(f"Target liq 1 pool +1")
+
             context_score = min(max(context_score, 0.0), 25.0)
 
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             # D. ENTRY LOCATION  (0 – 15, pure bonus)
-            # ══════════════════════════════════════════════════════════════
-            #
-            # Where is price relative to institutional zones?
-            # Being INSIDE a zone is optimal — it is not required.
-            #
+            # ══════════════════════════════════════════════════════════════════
             entry_score = 0.0
             c5m_data = (data_manager.get_candles("5m") or []) if data_manager else []
             ob_atr = compute_atr(c5m_data, 14) if len(c5m_data) >= 15 else current_price * 0.002
@@ -3388,9 +3531,11 @@ class AdvancedICTStrategy:
                 if ob_atr > 0 and ob.size < ob_atr * 0.3:
                     continue  # sub-institutional OB
 
+                # Use virgin_multiplier() directly — no arbitrary visit_count
+                # override.  The class already encodes: virgin=1.30, one_touch=1.00,
+                # two_touch=0.70, which correctly penalises worn zones without
+                # a hard-coded 0.40 cliff that contradicts the class definition.
                 vm = ob.virgin_multiplier()
-                if ob.visit_count >= 2:
-                    vm = 0.40
 
                 in_ote  = ob.in_optimal_zone(current_price)
                 in_body = ob.contains_price(current_price)
@@ -3400,13 +3545,12 @@ class AdvancedICTStrategy:
                     raw_ob = ob.strength / 100.0 * (15.0 if in_ote else 11.0) * vm
                     if ob.bos_confirmed:    raw_ob += 2.0
                     if ob.has_displacement: raw_ob += 1.0
-                    # Apply regime multiplier before cap (single application)
                     raw_ob *= rs.ob_score_multiplier
                     raw_ob = min(raw_ob, 15.0)
                     entry_score = max(entry_score, raw_ob)
                     reasons.append(
                         f"OB {tag} {ob.low:.0f}-{ob.high:.0f} str={ob.strength:.0f} "
-                        f"v={ob.visit_count} ×{rs.ob_score_multiplier:.2f} +{raw_ob:.1f}"
+                        f"v={ob.visit_count} vm={vm:.2f} ×{rs.ob_score_multiplier:.2f} +{raw_ob:.1f}"
                     )
                     ctx.trigger_ob = ob
                     break
@@ -3416,7 +3560,6 @@ class AdvancedICTStrategy:
                 if fvg.is_price_in_gap(current_price):
                     freshness_pct = 1.0 - fvg.fill_percentage
                     raw_fvg = 13.0 * (0.5 + 0.5 * freshness_pct)
-                    # Apply regime multiplier before cap (single application)
                     raw_fvg *= rs.fvg_score_multiplier
                     raw_fvg = min(raw_fvg, 15.0)
                     entry_score = max(entry_score, raw_fvg)
@@ -3431,22 +3574,40 @@ class AdvancedICTStrategy:
                 entry_score = min(entry_score + 3.0, 15.0)
                 reasons.append("OB+FVG confluence +3")
 
+            # ── Sweep-zone proximity bonus (+0-4) ────────────────────────────
+            # ICT "mitigation block": when the entry zone (OB/FVG) sits AT the
+            # swept liquidity level, the institutional footprint is maximally
+            # concentrated.  Price was swept here, then MSS reversed here.
+            # The zone and the catalyst are the SAME price area.
+            # Proximity = distance(zone_midpoint, sweep_price) / zone_size.
+            # prox ≤ 2.0 means the sweep price is within two zone-widths of the mid.
+            if has_sweep and sweep_pool is not None and (ctx.trigger_ob or ctx.trigger_fvg):
+                sweep_px = sweep_pool.price
+                if ctx.trigger_ob:
+                    zone_mid  = ctx.trigger_ob.midpoint
+                    zone_size = max(ctx.trigger_ob.size, ob_atr * 0.1)
+                else:
+                    zone_mid  = ctx.trigger_fvg.midpoint
+                    zone_size = max(ctx.trigger_fvg.size, ob_atr * 0.1)
+                prox = abs(zone_mid - sweep_px) / zone_size
+                if prox <= 2.0:
+                    # Linear: prox=0 → +4, prox=2 → +0
+                    sweep_prox_bonus = round(max(0.0, 4.0 * (1.0 - prox / 2.0)), 1)
+                    if sweep_prox_bonus > 0:
+                        entry_score = min(entry_score + sweep_prox_bonus, 15.0)
+                        reasons.append(
+                            f"Zone@sweep level prox={prox:.1f} +{sweep_prox_bonus:.1f}")
+
             entry_score = min(entry_score, 15.0)
 
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             # E. MICROSTRUCTURE  (0 – 12, pure bonus)
-            # ══════════════════════════════════════════════════════════════
-            #
-            # Real-time order flow confirmation.  These are TIMING signals —
-            # they can be absent in early entries and appear later.
-            # Never a requirement.
-            #
+            # ══════════════════════════════════════════════════════════════════
+            # NOTE: AMD Manipulation is now scored in Component A (Catalyst).
+            # Component E scores real-time order flow + session timing only.
             micro_score = 0.0
 
-            # CVD — latched to prevent ±4 pt oscillation near threshold.
-            # A non-NEUTRAL signal is held for _CVD_HOLD_MS (30s) before
-            # reverting to NEUTRAL.  This stops tick-level noise from toggling
-            # the micro score in and out on consecutive evaluations.
+            # CVD — latched 30s to prevent ±score oscillation on consecutive ticks
             raw_cvd = self.volume_analyzer.get_cvd_signal().get("signal", "NEUTRAL")
             if raw_cvd != "NEUTRAL":
                 self._cvd_latch    = raw_cvd
@@ -3457,36 +3618,39 @@ class AdvancedICTStrategy:
 
             if side == "long":
                 if "STRONG" in cvd_sig and "BULL" in cvd_sig:
-                    micro_score += 8.0; reasons.append("CVD Strong Bull +8")
+                    micro_score += 6.0; reasons.append("CVD Strong Bull +6")
                 elif "BULL" in cvd_sig:
-                    micro_score += 4.0; reasons.append("CVD Bull +4")
+                    micro_score += 3.0; reasons.append("CVD Bull +3")
             else:
                 if "STRONG" in cvd_sig and "BEAR" in cvd_sig:
-                    micro_score += 8.0; reasons.append("CVD Strong Bear +8")
+                    micro_score += 6.0; reasons.append("CVD Strong Bear +6")
                 elif "BEAR" in cvd_sig:
-                    micro_score += 4.0; reasons.append("CVD Bear +4")
+                    micro_score += 3.0; reasons.append("CVD Bear +3")
 
-            # Absorption
+            # Absorption (institutional high-volume tiny-body candles at zone)
             abs_pts = self.absorption_model.absorption_near_price(current_price, side)
             if abs_pts > 0:
-                micro_score += min(abs_pts, 5.0)
-                reasons.append(f"Absorption +{min(abs_pts, 5):.0f}")
+                micro_score += min(abs_pts, 4.0)
+                reasons.append(f"Absorption +{min(abs_pts, 4):.0f}")
 
-            # AMD manipulation
-            if self.amd_phase == "MANIPULATION" and ctx.sweep_pool is not None:
-                micro_score += 3.0; reasons.append("AMD Manipulation +3")
-
-            # Killzone — threshold handled by _get_entry_threshold selector
+            # ── Session timing bonus ──────────────────────────────────────────
+            # Replaces the previous log-only killzone note that added zero points.
+            # London/NY killzone = +4, session hours (non-KZ) = +2.
+            # This reflects genuine edge: institutional sweeps during killzones
+            # are statistically more reliable than off-hours price action.
             if self.in_killzone:
                 kz_label = getattr(self, "_active_kz_name", self.current_session)
-                kz_thresh = config.ENTRY_THRESHOLD_KILLZONE
-                reasons.append(f"KZ {kz_label} (threshold→{kz_thresh:.0f})")
+                micro_score += 4.0
+                reasons.append(f"KZ {kz_label} +4")
+            elif self.current_session in ("NEW_YORK", "LONDON"):
+                micro_score += 2.0
+                reasons.append(f"Session {self.current_session} +2")
 
             micro_score = min(micro_score, 12.0)
 
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             # TOTAL
-            # ══════════════════════════════════════════════════════════════
+            # ══════════════════════════════════════════════════════════════════
             total = catalyst_score + structure_score + context_score + entry_score + micro_score
             total = min(max(total, 0.0), 100.0)
 
@@ -4687,11 +4851,7 @@ class AdvancedICTStrategy:
     def _detect_choch_against_position(self, side: str, current_time: int) -> bool:
         """
         Returns True if a confirmed CHoCH has formed AGAINST the open position
-        on the 15m timeframe only.
-
-        5m CHoCH signals are intentionally excluded — they produce too much noise
-        and cause premature exits on normal retracements. The 15m timeframe
-        provides cleaner, higher-conviction structure breaks.
+        on the trading timeframe (5m) or the next higher timeframe (15m).
 
         Rules — institutional definition:
           LONG position  → bearish CHoCH = price closes below a prior swing low
@@ -4707,7 +4867,7 @@ class AdvancedICTStrategy:
 
         entry_time = self.active_position.get("entry_time", 0) if self.active_position else 0
         max_age_ms = getattr(config, 'TRAIL_SWING_MAX_AGE_MS', 4 * 3600 * 1000)
-        valid_tfs   = {"15m"}  # 5m excluded — too noisy, causes premature exits
+        valid_tfs   = {"5m", "15m"}
 
         for ms in reversed(list(self.market_structures)):
             if ms.structure_type != "CHoCH":
