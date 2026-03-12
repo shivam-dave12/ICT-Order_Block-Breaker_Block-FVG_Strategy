@@ -282,6 +282,20 @@ class StructureEngine:
         Run full structure detection across all provided timeframes.
         candles_by_tf: {"5m": [...], "15m": [...], "1h": [...], "4h": [...]}
         """
+        # Rebuild dedup sets from current deque contents before detection.
+        # This ensures keys are always in sync with live deque state —
+        # no stale keys from cleanup removals or deque maxlen evictions.
+        self._registered_obs = {
+            (round(ob.low, 1), round(ob.high, 1), ob.direction, ob.timeframe)
+            for ob_list in [self.order_blocks_bull, self.order_blocks_bear]
+            for ob in ob_list
+        }
+        self._registered_fvgs = {
+            (round(f.bottom, 1), round(f.top, 1), f.direction, f.timeframe)
+            for fvg_list in [self.fvgs_bull, self.fvgs_bear]
+            for f in fvg_list
+        }
+
         # 1. Detect swings on each timeframe
         for tf, candles in candles_by_tf.items():
             if len(candles) < 10:
@@ -861,25 +875,35 @@ class StructureEngine:
     def _update_ob_visits(self, current_price: float, now_ms: int) -> None:
         """
         Track how many distinct times price has visited each OB.
-
-        A "visit" is counted when price ENTERS a zone it was previously
-        OUTSIDE of — not on every update cycle while price stays inside.
-        This means two rapid ticks inside the same OB count as ONE visit,
-        but leaving and returning later increments the counter correctly.
-
-        Uses self._ob_in_zone to track the currently-occupied set of OBs
-        across structure update cycles.
+        Also marks OBs broken when price closes through them.
         """
         currently_in: set = set()
 
         for ob_list in [self.order_blocks_bull, self.order_blocks_bear]:
             for ob in ob_list:
+                if ob.broken:
+                    continue
+                # Mark broken if price closes through the zone
+                if ob.direction == "bullish" and current_price < ob.low:
+                    ob.broken = True
+                    logger.debug(
+                        f"OB broken: bullish ${ob.low:.1f}–${ob.high:.1f} "
+                        f"[{ob.timeframe}] — price ${current_price:.1f} closed below"
+                    )
+                    continue
+                elif ob.direction == "bearish" and current_price > ob.high:
+                    ob.broken = True
+                    logger.debug(
+                        f"OB broken: bearish ${ob.low:.1f}–${ob.high:.1f} "
+                        f"[{ob.timeframe}] — price ${current_price:.1f} closed above"
+                    )
+                    continue
+
                 if not ob.is_active(now_ms):
                     continue
                 ob_key = (round(ob.low, 1), round(ob.high, 1), ob.direction)
                 if ob.contains_price(current_price):
                     currently_in.add(ob_key)
-                    # New entry: price just entered a zone it was NOT in last cycle
                     if ob_key not in self._ob_in_zone:
                         ob.visit_count += 1
                         logger.debug(
@@ -887,7 +911,6 @@ class StructureEngine:
                             f"{ob.direction} ${ob.low:.1f}–${ob.high:.1f}"
                         )
 
-        # Update the "in zone" tracking set for the next cycle
         self._ob_in_zone = currently_in
 
     # ==================================================================
@@ -904,6 +927,11 @@ class StructureEngine:
                          or not ob.is_active(now_ms)]
             for ob in to_remove:
                 obs.remove(ob)
+                # Unregister so the same price level can re-form a new OB later.
+                # Without this, any OB that ages/cleans out is permanently dead —
+                # its key stays in _registered_obs forever and blocks re-detection.
+                ob_key = (round(ob.low, 1), round(ob.high, 1), ob.direction, ob.timeframe)
+                self._registered_obs.discard(ob_key)
 
         for fvgs in [self.fvgs_bull, self.fvgs_bear]:
             to_remove = [f for f in fvgs
@@ -911,6 +939,9 @@ class StructureEngine:
                          or not f.is_active(now_ms)]
             for f in to_remove:
                 fvgs.remove(f)
+                # Same fix for FVGs — discard key so the gap can re-register
+                fvg_key = (round(f.bottom, 1), round(f.top, 1), f.direction, f.timeframe)
+                self._registered_fvgs.discard(fvg_key)
 
     # ==================================================================
     # QUERY HELPERS (used by strategy for confluence scoring)

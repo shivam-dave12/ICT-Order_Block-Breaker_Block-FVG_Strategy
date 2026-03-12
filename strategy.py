@@ -1080,6 +1080,28 @@ class AdvancedICTStrategy:
             _rs2 = self.regime_engine.state
             _trending2 = _rs2.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
                                           REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR)
+
+            # ── Unavailable-criterion reduction ──────────────────────────────
+            # If there are zero active directional OBs AND zero active directional
+            # FVGs, the "OB/FVG touch" L2 criterion is structurally impossible to
+            # satisfy — no zone exists to enter at.  Penalising the setup for a
+            # condition it literally cannot meet is wrong; drop l2_needed by 1 so
+            # the bot only has to satisfy 1 of the 2 remaining achievable criteria
+            # (sweep+displacement OR MSS).
+            if side == "long":
+                _active_obs  = [o for o in self.order_blocks_bull if o.is_active(now_ms)]
+                _active_fvgs = [f for f in self.fvgs_bull        if f.is_active(now_ms)]
+            else:
+                _active_obs  = [o for o in self.order_blocks_bear if o.is_active(now_ms)]
+                _active_fvgs = [f for f in self.fvgs_bear         if f.is_active(now_ms)]
+            _no_zones = len(_active_obs) == 0 and len(_active_fvgs) == 0
+            if _no_zones and l2_needed > 1:
+                l2_needed -= 1
+                logger.debug(
+                    f"L2: no active {side} OBs or FVGs — reducing l2_needed to {l2_needed} "
+                    f"(OB/FVG criterion unavailable)"
+                )
+
             high_conviction = (
                 (self.in_killzone and score >= 70) or
                 # Strong HTF alignment in a trending regime — structural case made by regime.
