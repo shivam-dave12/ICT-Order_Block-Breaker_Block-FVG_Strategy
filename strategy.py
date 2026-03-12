@@ -480,6 +480,14 @@ class AdvancedICTStrategy:
         _CHOCH_BLOCK_DURATION_MS                    = 30 * 60 * 1000  # 30-min window
         self._CHOCH_BLOCK_DURATION_MS: int          = _CHOCH_BLOCK_DURATION_MS
 
+        # ── AWAITING_CONF setup invalidation tracking ─────────────────────
+        # Tracks when each side first entered the "confirmation candle absent"
+        # state.  If the wait exceeds AWAITING_CONF_MAX_MINUTES the setup is
+        # structurally dead (zone consumed / no rejection ever came) and is
+        # killed.  Cleared when L1/L2 fail (new setup cycle) or entry fires.
+        # Key = side ("long" / "short"), Value = ms timestamp of first wait.
+        self._awaiting_conf_since: Dict[str, int] = {}
+
         # ── TP Guardian ─────────────────────────────────────────────────────
         # Background thread that keeps retrying TP placement until it succeeds
         # or the position closes.  Ensures we NEVER stay in a position without
@@ -1069,8 +1077,15 @@ class AdvancedICTStrategy:
             # L2 Gate — dynamic threshold for high-conviction
             l2_count, l2_labels = self._cascade_l2(side, current_price, ctx, now_ms)
             l2_needed = CASCADE_L2_MIN_TRIGGERS  # default 2
+            _rs2 = self.regime_engine.state
+            _trending2 = _rs2.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
+                                          REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR)
             high_conviction = (
                 (self.in_killzone and score >= 70) or
+                # Strong HTF alignment in a trending regime — structural case made by regime.
+                # No longer requires MSS to already be in l2_labels (circular dependency).
+                (self.htf_bias_strength >= 0.75 and _trending2 and score >= 55) or
+                # Original: very strong HTF + confirmed MSS
                 (self.htf_bias_strength >= 0.80 and any("MSS" in l for l in l2_labels))
             )
             if high_conviction:
@@ -2311,6 +2326,95 @@ class AdvancedICTStrategy:
 
         zone_size = zone_top - zone_bottom
 
+        # ── ZONE BREACH CHECK ────────────────────────────────────────────────
+        # If a recent candle BODY has closed completely beyond the zone in the
+        # breakout direction, the zone is consumed — no confirmation candle will
+        # ever print there.  This is the primary cause of AWAITING_CONF hangs:
+        # the bot sits at a zone that has been blown through while waiting for a
+        # rejection that structurally cannot come.
+        #
+        # SHORT: bearish FVG/OB is consumed when a candle body closes ABOVE zone_top
+        #        (bullish breakout through resistance → zone is now support, not resistance)
+        # LONG:  bullish FVG/OB is consumed when a candle body closes BELOW zone_bottom
+        if getattr(config, 'CONF_ZONE_BREACH_CHECK', True):
+            for c in recent[:-1]:   # skip current (forming) candle
+                try:
+                    c_close = float(c['c'])
+                    c_open  = float(c['o'])
+                    if side == "short":
+                        # Body high = max(open, close); breach if full body above zone_top
+                        body_high = max(c_close, c_open)
+                        if body_high > zone_top and c_close > zone_top:
+                            return False, (
+                                f"Zone consumed: candle body closed ${c_close:.1f} above "
+                                f"zone_top ${zone_top:.1f} — bearish zone breached by bulls"
+                            )
+                    else:  # long
+                        body_low = min(c_close, c_open)
+                        if body_low < zone_bottom and c_close < zone_bottom:
+                            return False, (
+                                f"Zone consumed: candle body closed ${c_close:.1f} below "
+                                f"zone_bottom ${zone_bottom:.1f} — bullish zone breached by bears"
+                            )
+                except Exception:
+                    continue
+
+        # ── APPROACH DIRECTION CHECK ─────────────────────────────────────────
+        # For a SHORT at a bearish FVG/OB, price must approach FROM ABOVE —
+        # i.e. it must have recently traded above zone_top and now be pulling
+        # back into the zone.  If price has been below zone_top for the entire
+        # lookback window and is grinding UP through the zone, that is a bullish
+        # breakout, not an institutional retest.
+        #
+        # For a LONG at a bullish FVG/OB, the mirror applies: price must have
+        # recently traded below zone_bottom (swept below it) and now be pulling
+        # back up into the zone.
+        #
+        # Thrust guard: if 2+ of the last 4 candles are full-body closes THROUGH
+        # the zone in the breakout direction, declare it a penetration (trend),
+        # not a retest.
+        lookback_n  = getattr(config, 'CONF_APPROACH_LOOKBACK',   8)
+        thrust_max  = getattr(config, 'CONF_APPROACH_THRUST_MAX',  2)
+        approach_window = candles_5m[-(lookback_n + 1):-1]   # last N closed candles
+
+        if approach_window:
+            if side == "short":
+                # Require: price recently traded above zone_top (from_above)
+                recently_above = any(float(c['h']) > zone_top for c in approach_window)
+                if not recently_above:
+                    return False, (
+                        f"Approach invalid: price never traded above zone_top ${zone_top:.1f} "
+                        f"in last {lookback_n} bars — cannot be a bearish retest"
+                    )
+                # Thrust guard: bullish momentum driving through zone = breakout
+                last4 = approach_window[-4:] if len(approach_window) >= 4 else approach_window
+                bull_thrust = sum(
+                    1 for c in last4
+                    if float(c['c']) > zone_top and float(c['c']) > float(c['o'])
+                )
+                if bull_thrust >= thrust_max:
+                    return False, (
+                        f"Approach invalid: {bull_thrust} bullish candles closed above zone_top "
+                        f"${zone_top:.1f} — price breaking out, not rejecting"
+                    )
+            else:  # long
+                recently_below = any(float(c['l']) < zone_bottom for c in approach_window)
+                if not recently_below:
+                    return False, (
+                        f"Approach invalid: price never traded below zone_bottom ${zone_bottom:.1f} "
+                        f"in last {lookback_n} bars — cannot be a bullish retest"
+                    )
+                last4 = approach_window[-4:] if len(approach_window) >= 4 else approach_window
+                bear_thrust = sum(
+                    1 for c in last4
+                    if float(c['c']) < zone_bottom and float(c['c']) < float(c['o'])
+                )
+                if bear_thrust >= thrust_max:
+                    return False, (
+                        f"Approach invalid: {bear_thrust} bearish candles closed below zone_bottom "
+                        f"${zone_bottom:.1f} — price breaking down, not bouncing"
+                    )
+
         if side == "long":
             for c in reversed(recent[:-1]):   # skip the current (forming) candle
                 try:
@@ -2391,6 +2495,9 @@ class AdvancedICTStrategy:
                 # ── L1 GATE: HTF Bias + DR alignment + no failed setup ────
                 l1_pass, l1_reason = self._cascade_l1(side, current_price, now_ms)
                 if not l1_pass:
+                    # L1 fail = market condition changed; reset any AWAITING_CONF
+                    # tracker for this side so the next valid cycle starts fresh.
+                    self._awaiting_conf_since.pop(side, None)
                     logger.debug(f"⛔ {side.upper()} L1 rejected: {l1_reason}")
                     continue
 
@@ -2411,6 +2518,8 @@ class AdvancedICTStrategy:
                     l2_needed = 1  # Strong setup — reduce L2 requirement
 
                 if l2_count < l2_needed:
+                    # L2 fail = structural confluence broke; reset AWAITING_CONF tracker.
+                    self._awaiting_conf_since.pop(side, None)
                     logger.debug(f"⛔ {side.upper()} L2 rejected: {l2_count}/{l2_needed} "
                                  f"(have: {', '.join(l2_labels) if l2_labels else 'none'}) "
                                  f"Score={score:.0f} Reasons=[{', '.join(reasons[:3])}]")
@@ -2442,6 +2551,36 @@ class AdvancedICTStrategy:
                 conf_ok, conf_reason = self._check_confirmation_candle(
                     side, c5m, ctx, current_price)
                 if not conf_ok:
+                    # ── AWAITING_CONF timeout (industry-grade) ─────────────
+                    # Track how long we have been waiting for a confirmation
+                    # candle at this zone.  If we exceed AWAITING_CONF_MAX_MINUTES
+                    # the zone is structurally dead (consumed / no rejection ever
+                    # came).  Kill the setup and apply a brief lockout so the
+                    # same dead zone is not immediately re-evaluated.
+                    CONF_MAX_MS = int(
+                        getattr(config, 'AWAITING_CONF_MAX_MINUTES', 50) * 60_000
+                    )
+                    if side not in self._awaiting_conf_since:
+                        # First time we are waiting — record the timestamp
+                        self._awaiting_conf_since[side] = now_ms
+                    elif (now_ms - self._awaiting_conf_since[side]) >= CONF_MAX_MS:
+                        # Timeout — setup is dead; kill it and apply lockout
+                        waited_min = (now_ms - self._awaiting_conf_since[side]) / 60_000
+                        self._awaiting_conf_since.pop(side, None)
+                        lockout_ms = int(
+                            getattr(config, 'CONF_TIMEOUT_LOCKOUT_MINUTES', 10) * 60_000
+                        )
+                        self._placement_locked_until = max(
+                            self._placement_locked_until,
+                            now_ms + lockout_ms
+                        )
+                        logger.info(
+                            f"⛔ {side.upper()} AWAITING_CONF timeout after "
+                            f"{waited_min:.0f}m — zone consumed or no rejection printed. "
+                            f"Setup invalidated. {lockout_ms // 60_000}m lockout applied."
+                        )
+                        continue
+
                     rej_key = f"NO_CONF_{side}"
                     if self._should_log_rejection(side, rej_key, now_ms):
                         logger.info(
@@ -2449,6 +2588,9 @@ class AdvancedICTStrategy:
                             f"— awaiting institutional rejection print at zone"
                         )
                     continue
+
+                # Confirmation passed — clear any AWAITING_CONF tracker for this side
+                self._awaiting_conf_since.pop(side, None)
 
                 # ── ATR SL DISTANCE PRE-VALIDATION (REMOVED) ─────────────────
                 # Previously blocked when raw anchor distance < 1.0×ATR.
@@ -2953,7 +3095,15 @@ class AdvancedICTStrategy:
         # Only strong conviction (≥65%) yields genuinely directional flow.
         # Retracement trades use a lower bar (45%) because displacement itself
         # provides the structural conviction.
-        min_strength = 0.45 if self._is_retracement_trade(side) else 0.65
+        # ACCUMULATION / TRENDING_BULL regime: smart money is absorbing at any
+        # dip — the structural case is already made by regime; allow 60% min.
+        if self._is_retracement_trade(side):
+            min_strength = 0.45
+        elif (rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL) and side == "long") or \
+             (rs.regime in (REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR) and side == "short"):
+            min_strength = 0.60   # regime provides extra structural conviction
+        else:
+            min_strength = 0.65
         if self.htf_bias_strength < min_strength:
             return False, (
                 f"HTF {self.htf_bias} bias too weak ({self.htf_bias_strength:.0%} "
@@ -2981,11 +3131,23 @@ class AdvancedICTStrategy:
             dz = self._ndr.daily.zone_pct(price)
             strong_htf = self.htf_bias_strength >= 0.80
 
+            # In ACCUMULATION regime, smart money legitimately bids in premium
+            # zone — raise the block threshold to 88% so price can trend higher.
+            # In DISTRIBUTION regime, smart money offers in discount zone — mirror.
+            if rs.regime == REGIME_ACCUMULATION and side == "long":
+                dr_long_limit = 0.88
+            else:
+                dr_long_limit = 0.75
+            if rs.regime == REGIME_DISTRIBUTION and side == "short":
+                dr_short_limit = 0.12
+            else:
+                dr_short_limit = 0.25
+
             if side == "long":
-                if dz > 0.75 and not strong_htf:
+                if dz > dr_long_limit and not strong_htf:
                     return False, f"Daily DR extreme premium ({dz:.0%}) blocks long"
             elif side == "short":
-                if dz < 0.25 and not strong_htf:
+                if dz < dr_short_limit and not strong_htf:
                     return False, f"Daily DR extreme discount ({dz:.0%}) blocks short"
 
         return True, "L1_OK"
@@ -3015,7 +3177,7 @@ class AdvancedICTStrategy:
         if self._is_retracement_trade(side):
             met.append("DISPLACEMENT")
 
-        # B. Swept liquidity — MUST be fresh AND displaced
+        # B. Swept liquidity — MUST be fresh AND displaced AND within distance leash
         SWEEP_FRESHNESS_MS = 45 * 60 * 1000   # 45 minutes — institutional relevance window
         if ctx.sweep_pool is not None:
             pool = ctx.sweep_pool
@@ -3024,10 +3186,31 @@ class AdvancedICTStrategy:
             has_disp = pool.displacement_confirmed
             has_wick = pool.wick_rejection
 
-            if is_fresh and has_disp and has_wick:
+            # ── Distance leash (industry-grade) ─────────────────────────────
+            # If price has extended more than SWEEP_MAX_EXTENSION_PCT beyond
+            # the sweep level, the signal is dead.  A genuine sweep+reversal
+            # retraces; a sweep that keeps running is a breakout/trend move.
+            # At 0.8% on BTC that is ~$560 at $70K — a full impulse candle.
+            # EXCEPTION: In trending/accumulation regimes, price legitimately
+            # runs 1-2% after a sweep before forming a re-entry.  Allow 1.8%.
+            base_ext = getattr(config, 'SWEEP_MAX_EXTENSION_PCT', 0.008)
+            regime_ext = self.regime_engine.state.regime if hasattr(self, 'regime_engine') else None
+            trending_regime = regime_ext in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL, REGIME_TRENDING_BEAR)
+            SWEEP_MAX_EXT = base_ext * 2.25 if trending_regime else base_ext
+            extension = abs(price - pool.price) / max(pool.price, 1)
+            is_within_leash = extension <= SWEEP_MAX_EXT
+
+            if is_fresh and has_disp and has_wick and is_within_leash:
                 met.append("SWEEP_DISP_FRESH")
-            elif is_fresh and has_disp:
+            elif is_fresh and has_disp and is_within_leash:
                 met.append("SWEEP_DISP")
+            elif is_fresh and not is_within_leash:
+                # Sweep is time-fresh but price has overextended — structurally dead.
+                # Log once (suppressed by debug level) so this doesn't spam the console.
+                logger.debug(
+                    f"L2: Sweep @ ${pool.price:.1f} overextended: price ${price:.1f} "
+                    f"is {extension*100:.2f}% away (max {SWEEP_MAX_EXT*100:.1f}%) — sweep dead"
+                )
             elif is_fresh:
                 # Stale or no displacement: does not count as a full trigger
                 pass  # Not counted — sweep without displacement is noise
@@ -3062,18 +3245,36 @@ class AdvancedICTStrategy:
             sweep_ts = ctx.sweep_pool.sweep_timestamp if ctx.sweep_pool else 0
             age_ms = now - ms.timestamp
 
-            if age_ms > MSS_MAX_AGE_MS:
+            # In trending/accumulation regimes, MSS age window is extended
+            # by 50% — structure persists longer in trending conditions.
+            _rs = self.regime_engine.state
+            _trending = _rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
+                                        REGIME_TRENDING_BEAR, REGIME_DISTRIBUTION)
+            effective_max_age = int(MSS_MAX_AGE_MS * 1.5) if _trending else MSS_MAX_AGE_MS
+
+            if age_ms > effective_max_age:
                 # MSS too old — not valid for entry
                 logger.debug(
                     f"L2: MSS_{ms.structure_type} [{ms.timeframe}] "
-                    f"is {age_ms / 60_000:.0f}m old (max {config.MSS_MAX_AGE_MINUTES}m) — expired"
+                    f"is {age_ms / 60_000:.0f}m old (max {effective_max_age / 60_000:.0f}m) — expired"
                 )
             elif ms.timestamp < sweep_ts:
-                # MSS formed before the sweep — old structure, not valid confirmation
-                logger.debug(
-                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
-                    f"({(ms.timestamp - sweep_ts) / 60_000:.0f}m earlier) — not counted"
-                )
+                # MSS formed before the sweep.
+                # In trending regimes, an MSS that formed up to 60 min before
+                # the sweep is still valid structural context — price BOS'd first,
+                # then liquidity was swept into that BOS.  Allow it.
+                pre_sweep_ms = sweep_ts - ms.timestamp
+                if _trending and pre_sweep_ms <= 60 * 60 * 1000:
+                    met.append(f"MSS_{ms.structure_type}")
+                    logger.debug(
+                        f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep by "
+                        f"{pre_sweep_ms / 60_000:.0f}m — allowed in trending regime"
+                    )
+                else:
+                    logger.debug(
+                        f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
+                        f"({pre_sweep_ms / 60_000:.0f}m earlier) — not counted"
+                    )
             else:
                 met.append(f"MSS_{ms.structure_type}")
 
@@ -5916,6 +6117,8 @@ class AdvancedICTStrategy:
         self.remainder_order_qty     = 0.0
         self.remainder_order_price   = 0.0
         self._remainder_accounted_fill = 0.0
+        # AWAITING_CONF tracking — clear on position close so next cycle starts fresh
+        self._awaiting_conf_since.clear()
 
     def _cancel_pending_sl_tp(self, order_manager) -> None:
         """Cancel pre-placed SL and TP orders when entry is cancelled with no fill.

@@ -354,3 +354,29 @@ RANGE_BOUND_MIN_CANDLES_5M   = 60        # need enough data to confirm range
 # Range-bound trades don't produce BOS (market is ranging by definition).
 # Instead of waiting for BOS to activate trailing, use profit-based gate.
 RANGE_BOUND_TRAIL_ACTIVATION_RR = 0.5    # activate trail after 0.5R in profit
+
+
+# ─────────────────────────────────────────────
+# ZONE INVALIDATION & CONFIRMATION ENGINE
+# ─────────────────────────────────────────────
+# Industry-grade fix for the "missed spike" class of failures:
+#   1. Sweep distance leash — if price has run >0.8% beyond the sweep
+#      level, the signal is structurally dead (trend, not reversal).
+#   2. Zone breach detection — if a candle BODY closes beyond the zone
+#      in the breakout direction, the zone is consumed.  No confirmation
+#      candle can ever fire at a consumed zone.
+#   3. Approach direction — for a SHORT at a bearish FVG/OB, price must
+#      have recently been ABOVE the zone (retest from above), not
+#      grinding bullishly up through it.
+#   4. AWAITING_CONF timeout — if we have been waiting for a confirmation
+#      candle for longer than AWAITING_CONF_MAX_MINUTES without getting
+#      one, the setup is structurally invalid and is killed.  A brief
+#      lockout prevents immediate re-evaluation of the same dead zone.
+
+SWEEP_MAX_EXTENSION_PCT      = 0.008   # 0.8% — price distance leash on sweep signal
+CONF_ZONE_BREACH_CHECK       = True    # enable zone body-breach invalidation
+CONF_APPROACH_LOOKBACK       = 8       # candles back to detect valid approach direction
+CONF_APPROACH_THRUST_MAX     = 2       # max bullish/bearish through-zone candles
+                                        # before approach is declared a breakout
+AWAITING_CONF_MAX_MINUTES    = 50      # max wait for confirmation candle (10 × 5m bars)
+CONF_TIMEOUT_LOCKOUT_MINUTES = 10      # lockout applied after conf timeout
