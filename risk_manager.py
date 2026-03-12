@@ -203,47 +203,41 @@ class RiskManager:
             if sl_pct > 0.10:
                 logger.warning(f"SL very wide: {sl_pct*100:.2f}% — proceeding with caution")
 
-            # ══════════════════════════════════════════════════════════════
-            # POSITION SIZING — BALANCE_USAGE_PERCENTAGE is the PRIMARY driver.
-            #
-            # BALANCE_USAGE_PERCENTAGE (60%) = fraction of available balance
-            # used as margin for this trade.  At 25× leverage that directly
-            # determines notional and therefore the BTC quantity sent.
-            #
-            # RISK_PER_TRADE (0.60%) = maximum dollar loss accepted if SL
-            # fires.  This is a SAFETY CAP: if the BALANCE_USAGE-derived
-            # position would risk more than RISK_PER_TRADE% on SL, we scale
-            # the position DOWN to honour the risk cap.  It never inflates size.
-            #
-            # MIN/MAX_MARGIN_PER_TRADE are hard bounds on the margin dollars,
-            # applied to the actual margin — NOT to the dollar_risk budget.
-            # ══════════════════════════════════════════════════════════════
+            # ── Step 1: Dollar risk budget ────────────────────────────
+            # RISK_PER_TRADE is the % of balance we accept LOSING if SL fires.
+            # e.g. RISK_PER_TRADE=0.60 → risk $6 on a $1000 balance.
+            # BALANCE_USAGE_PERCENTAGE is a margin/capital allocation cap used
+            # only in Step 3, NOT as the risk input here.
+            dollar_risk = available * (config.RISK_PER_TRADE / 100)
+            dollar_risk = max(config.MIN_MARGIN_PER_TRADE,
+                              min(dollar_risk, config.MAX_MARGIN_PER_TRADE))
 
-            # ── Step 1: Target margin from BALANCE_USAGE_PERCENTAGE ──────
-            target_margin = available * (config.BALANCE_USAGE_PERCENTAGE / 100)
-            target_margin = max(config.MIN_MARGIN_PER_TRADE,
-                                min(target_margin, config.MAX_MARGIN_PER_TRADE))
+            # ── Step 2: Risk-based notional + qty ─────────────────────
+            # If we risk $dollar_risk at sl_pct, we can hold this notional:
+            notional = dollar_risk / sl_pct            # e.g. $60 / 0.005 = $12,000
+            position_size = notional / entry_price     # e.g. $12,000 / $90,000 = 0.133 BTC
 
-            # ── Step 2: Notional + qty from target margin ─────────────────
-            notional      = target_margin * config.LEVERAGE
-            position_size = notional / entry_price
+            # ── Step 3: Margin cap ────────────────────────────────────
+            # Ensure the margin required does not exceed the hard limits.
+            # margin_required = notional / leverage  (what the exchange holds)
+            margin_required = position_size * entry_price / config.LEVERAGE
+            max_margin = min(
+                available * (config.BALANCE_USAGE_PERCENTAGE / 100),
+                config.MAX_MARGIN_PER_TRADE
+            )
+            max_margin = max(max_margin, config.MIN_MARGIN_PER_TRADE)
 
-            # ── Step 3: Risk guard — cap at RISK_PER_TRADE% dollar risk ──
-            # If the SL would trigger a loss > RISK_PER_TRADE% of balance,
-            # scale the position down.  This is a hard ceiling, never a floor.
-            max_dollar_risk = available * (config.RISK_PER_TRADE / 100)
-            actual_dollar_risk = position_size * price_distance
-            if actual_dollar_risk > max_dollar_risk:
-                scale = max_dollar_risk / actual_dollar_risk
-                position_size   = position_size * scale
-                notional        = position_size * entry_price
-                target_margin   = notional / config.LEVERAGE
+            if margin_required > max_margin:
+                scale = max_margin / margin_required
+                position_size = position_size * scale
+                notional      = position_size * entry_price
+                margin_required = max_margin
                 logger.debug(
-                    f"Risk cap applied: SL risk ${actual_dollar_risk:.2f} "
-                    f"> max ${max_dollar_risk:.2f} → scaled by {scale:.3f}"
+                    f"Position scaled by {scale:.3f} to respect "
+                    f"margin cap ${max_margin:.2f}"
                 )
 
-            # ── Step 4: Hard position limits ──────────────────────────────
+            # ── Step 4: Hard limits ───────────────────────────────────
             position_size = max(config.MIN_POSITION_SIZE,
                                 min(position_size, config.MAX_POSITION_SIZE))
             position_size = round(position_size, 4)
@@ -255,18 +249,17 @@ class RiskManager:
                 )
                 return None
 
-            # ── Logging ───────────────────────────────────────────────────
-            actual_notional    = position_size * entry_price
-            actual_margin      = actual_notional / config.LEVERAGE
-            actual_dollar_risk = position_size * price_distance
-            actual_risk_pct    = actual_dollar_risk / available * 100
-            margin_pct         = actual_margin / available * 100
+            # ── Logging ───────────────────────────────────────────────
+            actual_notional      = position_size * entry_price
+            actual_margin        = actual_notional / config.LEVERAGE
+            actual_dollar_risk   = position_size * price_distance   # loss if SL fires
+            actual_risk_pct      = actual_dollar_risk / available * 100
 
             logger.info(
                 f"✅ Position sized: {position_size:.4f} BTC | "
                 f"Notional: ${actual_notional:,.0f} | "
-                f"Margin: ${actual_margin:.2f} ({margin_pct:.1f}% of balance) | "
-                f"$ Risk @ SL: ${actual_dollar_risk:.2f} ({actual_risk_pct:.2f}%) | "
+                f"Margin: ${actual_margin:.2f} | "
+                f"$ Risk @ SL: ${actual_dollar_risk:.2f} ({actual_risk_pct:.2f}% of balance) | "
                 f"SL dist: {sl_pct*100:.3f}%"
             )
             return position_size
@@ -301,12 +294,7 @@ class RiskManager:
                     config.MIN_TIME_BETWEEN_TRADES * 60 - time_since_last)
                 return False, f"Cooldown: {remaining}s remaining"
 
-            # ── Post-loss cooldown ────────────────────────────────────────────
-            # This check requires TRADE_COOLDOWN_SECONDS > MIN_TIME_BETWEEN_TRADES*60
-            # to have any effect (otherwise the general cooldown above already
-            # covers the same window). With config defaults of both = 600s the
-            # checks are equivalent; set TRADE_COOLDOWN_SECONDS > 600 to enforce
-            # a longer pause specifically after losing trades.
+            # ── Loss cooldown (new) ───────────────────────────────────────────
             cooldown = getattr(config, "TRADE_COOLDOWN_SECONDS", 300)
             if (self.consecutive_losses > 0 and
                     self.last_trade_time > 0 and

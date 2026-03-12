@@ -16,12 +16,7 @@ import threading
 from typing import Callable, Dict, Optional, List
 from datetime import datetime, timedelta
 
-# NOTE: Do NOT call logging.basicConfig here. This module is a library
-# imported by data_manager.py → main.py. Calling basicConfig at import time
-# installs a default StreamHandler on the root logger before main.py's custom
-# ISTFormatter handlers are configured, making basicConfig a no-op in main.py
-# (it is idempotent once any handler exists). All log configuration belongs
-# in main.py exclusively.
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -203,58 +198,23 @@ class FuturesWebSocket:
                 logger.error(f"Handler error: {e}", exc_info=True)
 
     def _resubscribe_all(self):
-        """
-        Re-establish all subscriptions AND restore callbacks after a reconnect.
-
-        BUG FIXED: Previously this method cleared the callback lists but only
-        stored {'pair': ...} in _subscriptions — no callback reference.
-        After reconnect, events arrived from the exchange but no callbacks
-        were invoked, making the bot completely blind to market data for the
-        rest of the session.
-
-        Fix: _subscriptions now stores the callback alongside the pair so
-        _resubscribe_all can fully restore both the exchange subscription
-        AND the in-process callback routing.
-        """
+        """✅ CRITICAL FIX: Resubscribe to all previous subscriptions after reconnect"""
         with self._subscriptions_lock:
             logger.info("🔄 Resubscribing to all streams after reconnect...")
 
-            # Restore callback lists from stored subscriptions BEFORE emitting,
-            # so that any events arriving immediately after the subscribe emit
-            # are already routed to the correct callbacks.
+            # ✅ FIX: Clear all callback lists before resubscribing.
+            # Without this, each reconnect appends duplicate callbacks because
+            # subscribe_* methods re-register the same functions, and the
+            # 'if callback not in' guard only works if the list was not cleared.
+            # We MUST wipe here so callers can safely call subscribe_* again.
             with self._callbacks_lock:
                 self.orderbook_callbacks.clear()
                 self.candlestick_callbacks.clear()
                 self.trades_callbacks.clear()
                 self.ticker_callbacks.clear()
-
-                for sub in self._subscriptions["orderbook"]:
-                    cb = sub.get("callback")
-                    if cb and cb not in self.orderbook_callbacks:
-                        self.orderbook_callbacks.append(cb)
-
-                for sub in self._subscriptions["candlestick"]:
-                    cb = sub.get("callback")
-                    interval_key = sub.get("interval_key", "")
-                    if cb and interval_key:
-                        if interval_key not in self.candlestick_callbacks:
-                            self.candlestick_callbacks[interval_key] = []
-                        if cb not in self.candlestick_callbacks[interval_key]:
-                            self.candlestick_callbacks[interval_key].append(cb)
-
-                for sub in self._subscriptions["trades"]:
-                    cb = sub.get("callback")
-                    if cb and cb not in self.trades_callbacks:
-                        self.trades_callbacks.append(cb)
-
-                for sub in self._subscriptions["ticker"]:
-                    cb = sub.get("callback")
-                    if cb and cb not in self.ticker_callbacks:
-                        self.ticker_callbacks.append(cb)
-
-            logger.info("✅ Callbacks restored before resubscription")
-
-            # Re-emit subscription events to the exchange
+            logger.info("🧹 Callback lists cleared before resubscription")
+            
+            # Resubscribe orderbook
             for sub in self._subscriptions["orderbook"]:
                 try:
                     self.sio.emit(
@@ -265,7 +225,8 @@ class FuturesWebSocket:
                     logger.info(f"✓ Resubscribed to orderbook: {sub['pair']}")
                 except Exception as e:
                     logger.error(f"Error resubscribing orderbook {sub['pair']}: {e}")
-
+            
+            # Resubscribe candlestick
             for sub in self._subscriptions["candlestick"]:
                 try:
                     self.sio.emit(
@@ -276,7 +237,8 @@ class FuturesWebSocket:
                     logger.info(f"✓ Resubscribed to candlestick: {sub['pair']}")
                 except Exception as e:
                     logger.error(f"Error resubscribing candlestick {sub['pair']}: {e}")
-
+            
+            # Resubscribe trades
             for sub in self._subscriptions["trades"]:
                 try:
                     self.sio.emit(
@@ -287,7 +249,8 @@ class FuturesWebSocket:
                     logger.info(f"✓ Resubscribed to trades: {sub['pair']}")
                 except Exception as e:
                     logger.error(f"Error resubscribing trades {sub['pair']}: {e}")
-
+            
+            # Resubscribe ticker
             for sub in self._subscriptions["ticker"]:
                 try:
                     self.sio.emit(
@@ -298,7 +261,7 @@ class FuturesWebSocket:
                     logger.info(f"✓ Resubscribed to ticker: {sub['pair']}")
                 except Exception as e:
                     logger.error(f"Error resubscribing ticker {sub['pair']}: {e}")
-
+            
             logger.info("🔄 Resubscription complete")
 
     def connect(self, timeout: int = 30) -> bool:
@@ -354,10 +317,10 @@ class FuturesWebSocket:
                 if callback not in self.orderbook_callbacks:
                     self.orderbook_callbacks.append(callback)
         
-        # Store subscription WITH callback so _resubscribe_all can restore it
+        # ✅ Store subscription for auto-resubscribe
         with self._subscriptions_lock:
             if not any(s['pair'] == pair for s in self._subscriptions["orderbook"]):
-                self._subscriptions["orderbook"].append({'pair': pair, 'callback': callback})
+                self._subscriptions["orderbook"].append({'pair': pair})
         
         logger.info(f"Subscribing to orderbook: {pair}")
         self.sio.emit(self.EVENT_ORDERBOOK, subscribe_data, namespace=self.NAMESPACE)
@@ -368,7 +331,7 @@ class FuturesWebSocket:
         pair_with_interval = f"{pair}_{interval}"
         subscribe_data = {'event': 'subscribe', 'pair': pair_with_interval}
         
-        # Register callback under its interval key
+        # ✅ FIX: Register callback under its interval key
         if callback:
             interval_key = str(interval)
             with self._callbacks_lock:
@@ -377,14 +340,10 @@ class FuturesWebSocket:
                 if callback not in self.candlestick_callbacks[interval_key]:
                     self.candlestick_callbacks[interval_key].append(callback)
         
-        # Store subscription WITH callback and interval_key so _resubscribe_all can restore it
+        # ✅ Store subscription for auto-resubscribe
         with self._subscriptions_lock:
             if not any(s['pair'] == pair_with_interval for s in self._subscriptions["candlestick"]):
-                self._subscriptions["candlestick"].append({
-                    'pair': pair_with_interval,
-                    'callback': callback,
-                    'interval_key': str(interval),
-                })
+                self._subscriptions["candlestick"].append({'pair': pair_with_interval})
         
         logger.info(f"Subscribing to candlestick: {pair_with_interval} (interval_key={interval})")
         self.sio.emit(self.EVENT_CANDLESTICK, subscribe_data, namespace=self.NAMESPACE)
@@ -399,10 +358,10 @@ class FuturesWebSocket:
                 if callback not in self.trades_callbacks:
                     self.trades_callbacks.append(callback)
         
-        # Store subscription WITH callback so _resubscribe_all can restore it
+        # ✅ Store subscription for auto-resubscribe
         with self._subscriptions_lock:
             if not any(s['pair'] == pair for s in self._subscriptions["trades"]):
-                self._subscriptions["trades"].append({'pair': pair, 'callback': callback})
+                self._subscriptions["trades"].append({'pair': pair})
         
         logger.info(f"Subscribing to trades: {pair}")
         self.sio.emit(self.EVENT_TRADES, subscribe_data, namespace=self.NAMESPACE)

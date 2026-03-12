@@ -45,10 +45,8 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────
 PLACEMENT_LOCK_SECONDS    = 60
-
-# Narrative engine minimums (replace old binary L2/L3 gate constants)
-NCS_MIN_CATALYST  = 10.0   # catalyst component floor — no footprint, no trade
-NCS_MIN_CONTEXT   = 15.0   # context component floor — no alignment, no trade
+CASCADE_L2_MIN_TRIGGERS   = 2
+CASCADE_L3_MIN_CONFIRMS   = 1
 
 # Virgin OB multipliers
 OB_VIRGIN_MULT            = 1.30
@@ -414,20 +412,14 @@ class AdvancedICTStrategy:
         self.daily_pnl              = 0.0
 
         # Trade tracking (for detailed close reports)
-        self.entry_score              = 0.0
+        self.entry_score            = 0.0
         self.entry_reasons: List[str] = []
-        self.entry_components: Dict   = {}   # NCS breakdown at entry
-        self.entry_quantity           = 0.0
-        self.max_favorable_excursion  = 0.0
-        self.max_adverse_excursion    = 0.0
+        self.entry_quantity         = 0.0
+        self.max_favorable_excursion = 0.0
+        self.max_adverse_excursion   = 0.0
 
         # Timing
         self._last_structure_update_ms = 0
-        # CVD hold: latch a confirmed non-NEUTRAL CVD signal for 30s to prevent
-        # the micro score from oscillating ±4 pts between ticks near the threshold.
-        self._cvd_latch:      str = "NEUTRAL"
-        self._cvd_latch_ms:   int = 0
-        self._CVD_HOLD_MS:    int = 30_000   # hold CVD signal 30 seconds
         # self._last_entry_eval_ms removed — entry eval runs every tick
         self._last_outlook_ms          = 0
         self._placement_locked_until   = 0
@@ -1077,46 +1069,100 @@ class AdvancedICTStrategy:
                 plan["gate_failed"] = f"L1: {l1_reason}"
                 return plan
 
-            # ── Narrative Completeness Score ──────────────────────────────
-            score, reasons, ctx, components = self._score_narrative(
-                side, current_price, data_manager, now_ms)
-            plan["score"]      = score
-            plan["reasons"]    = reasons
-            plan["components"] = components   # C/S/X/E/M breakdown for Telegram
+            # Score confluence
+            score, reasons, ctx = self._score_confluence(side, current_price, data_manager, now_ms)
+            plan["score"] = score
+            plan["reasons"] = reasons
 
-            # ── Component minimums (replace L2/L3 binary gates) ───────────
-            if components["catalyst"] < NCS_MIN_CATALYST:
-                plan["status"]      = "BLOCKED_NO_NARRATIVE"
-                plan["gate_failed"] = (
-                    f"No catalyst ({components['catalyst']:.0f}/35) — "
-                    f"need sweep, displacement, or HTF BOS"
+            # L2 Gate — dynamic threshold for high-conviction
+            l2_count, l2_labels = self._cascade_l2(side, current_price, ctx, now_ms)
+            l2_needed = CASCADE_L2_MIN_TRIGGERS  # default 2
+            _rs2 = self.regime_engine.state
+            _trending2 = _rs2.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
+                                          REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR)
+
+            # ── Unavailable-criterion reduction ──────────────────────────────
+            # If there are zero active directional OBs AND zero active directional
+            # FVGs, the "OB/FVG touch" L2 criterion is structurally impossible to
+            # satisfy — no zone exists to enter at.  Penalising the setup for a
+            # condition it literally cannot meet is wrong; drop l2_needed by 1 so
+            # the bot only has to satisfy 1 of the 2 remaining achievable criteria
+            # (sweep+displacement OR MSS).
+            if side == "long":
+                _active_obs  = [o for o in self.order_blocks_bull if o.is_active(now_ms)]
+                _active_fvgs = [f for f in self.fvgs_bull        if f.is_active(now_ms)]
+            else:
+                _active_obs  = [o for o in self.order_blocks_bear if o.is_active(now_ms)]
+                _active_fvgs = [f for f in self.fvgs_bear         if f.is_active(now_ms)]
+            _no_zones = len(_active_obs) == 0 and len(_active_fvgs) == 0
+            if _no_zones and l2_needed > 1:
+                l2_needed -= 1
+                logger.debug(
+                    f"L2: no active {side} OBs or FVGs — reducing l2_needed to {l2_needed} "
+                    f"(OB/FVG criterion unavailable)"
                 )
-                plan["missing"] = "institutional sweep or displacement"
+
+            high_conviction = (
+                (self.in_killzone and score >= 70) or
+                # Strong HTF alignment in a trending regime — structural case made by regime.
+                # No longer requires MSS to already be in l2_labels (circular dependency).
+                (self.htf_bias_strength >= 0.75 and _trending2 and score >= 55) or
+                # Original: very strong HTF + confirmed MSS
+                (self.htf_bias_strength >= 0.80 and any("MSS" in l for l in l2_labels))
+            )
+            if high_conviction:
+                l2_needed = 1
+            if l2_count < l2_needed:
+                plan["status"] = "BLOCKED_L2"
+                missing_l2 = []
+                if not any("SWEEP" in l for l in l2_labels):
+                    missing_l2.append("sweep+displacement")
+                if not any("OB" in l or "FVG" in l for l in l2_labels):
+                    missing_l2.append("OB/FVG touch")
+                if not any("MSS" in l for l in l2_labels):
+                    missing_l2.append("MSS confirmation")
+                plan["gate_failed"] = f"L2: {l2_count}/{l2_needed} (have: {', '.join(l2_labels) if l2_labels else 'none'})"
+                plan["missing"] = ", ".join(missing_l2)
                 return plan
 
-            if components["context"] < NCS_MIN_CONTEXT:
-                plan["status"]      = "BLOCKED_NO_ALIGNMENT"
-                plan["gate_failed"] = (
-                    f"Insufficient alignment ({components['context']:.0f}/25) — "
-                    f"HTF bias weak or DR opposed"
-                )
-                plan["missing"] = "stronger HTF alignment or better DR zone"
+            # L3 Gate
+            l3_count, l3_labels = self._cascade_l3(side, current_price, ctx, score, now_ms)
+            if l3_count < CASCADE_L3_MIN_CONFIRMS:
+                plan["status"] = "BLOCKED_L3"
+                plan["gate_failed"] = f"L3: {l3_count}/{CASCADE_L3_MIN_CONFIRMS} (need CVD/absorption/killzone/AMD/daily_bias)"
+                plan["missing"] = "CVD alignment, killzone, absorption, or daily bias"
                 return plan
 
-            # ── Threshold ─────────────────────────────────────────────────
+            # Threshold check
             threshold = self._get_entry_threshold()
+
+            # ── Structural confirmation bonus ──────────────────────────────
+            # When L2 fully passes AND price is confirmed INSIDE an OB or FVG,
+            # that is the highest-quality structural entry possible — price has
+            # self-selected into the zone. Add a score bonus so transient CVD/
+            # absorption fluctuations don't kill otherwise valid setups.
+            # This only fires AFTER L2 is passed to avoid gaming the gate.
+            if l2_count >= l2_needed:
+                zone_confirmed = any(t in l2_labels for t in ("FVG_TOUCH", "OB_BODY", "OB_OTE"))
+                mss_confirmed  = any("MSS" in t for t in l2_labels)
+                if zone_confirmed and mss_confirmed:
+                    conf_bonus = 12.0
+                    score += conf_bonus
+                    reasons.append(f"L2 zone+MSS confirmed +{conf_bonus:.0f}")
+                    plan["score"] = score
+                    plan["reasons"] = reasons
+                elif zone_confirmed:
+                    conf_bonus = 7.0
+                    score += conf_bonus
+                    reasons.append(f"L2 zone confirmed +{conf_bonus:.0f}")
+                    plan["score"] = score
+                    plan["reasons"] = reasons
+
             plan["threshold"] = threshold
             if score < threshold:
-                plan["status"]      = "BELOW_THRESHOLD"
+                plan["status"] = f"BELOW_THRESHOLD"
                 plan["gate_failed"] = f"Score {score:.0f} / need {threshold:.0f}"
-                plan["missing"]     = (
-                    f"need +{threshold - score:.0f} "
-                    f"(C={components['catalyst']:.0f} "
-                    f"S={components['structure']:.0f} "
-                    f"X={components['context']:.0f} "
-                    f"E={components['entry']:.0f} "
-                    f"M={components['micro']:.0f})"
-                )
+                plan["missing"] = f"need +{threshold - score:.0f} more confluence"
                 return plan
 
             # Calculate levels (dry run)
@@ -2397,17 +2443,10 @@ class AdvancedICTStrategy:
                         f"${zone_top:.1f} — price breaking out, not rejecting"
                     )
             else:  # long
-                # For an ORDER BLOCK: price must have swept below zone_bottom (wick below OB low)
-                # For a FAIR VALUE GAP: price just needs to have entered the gap (low < zone_top)
-                # ICT distinction: OB is a mitigation candle test; FVG is a gap-fill retracement.
-                is_fvg = ctx.trigger_ob is None and ctx.trigger_fvg is not None
-                approach_level = zone_top if is_fvg else zone_bottom
-                approach_desc  = f"zone_top ${zone_top:.1f} (FVG entry)" if is_fvg else f"zone_bottom ${zone_bottom:.1f} (OB sweep)"
-
-                recently_below = any(float(c['l']) < approach_level for c in approach_window)
+                recently_below = any(float(c['l']) < zone_bottom for c in approach_window)
                 if not recently_below:
                     return False, (
-                        f"Approach invalid: price never traded below {approach_desc} "
+                        f"Approach invalid: price never traded below zone_bottom ${zone_bottom:.1f} "
                         f"in last {lookback_n} bars — cannot be a bullish retest"
                     )
                 last4 = approach_window[-4:] if len(approach_window) >= 4 else approach_window
@@ -2507,32 +2546,45 @@ class AdvancedICTStrategy:
                     logger.debug(f"⛔ {side.upper()} L1 rejected: {l1_reason}")
                     continue
 
-                # ── Narrative Completeness Score ──────────────────────────
-                score, reasons, ctx, components = self._score_narrative(
+                # ── SCORE: Confluence scoring ──────────────────────────────
+                score, reasons, ctx = self._score_confluence(
                     side, current_price, data_manager, now_ms)
 
-                # ── Component minimums ────────────────────────────────────
-                if components["catalyst"] < NCS_MIN_CATALYST:
+                # ── L2 GATE: Need sweep + OB/FVG + MSS ────────────────────
+                l2_count, l2_labels = self._cascade_l2(side, current_price, ctx, now_ms)
+
+                # Dynamic L2 threshold: high-conviction setups need fewer triggers
+                l2_needed = CASCADE_L2_MIN_TRIGGERS  # default 2
+                high_conviction = (
+                    (self.in_killzone and score >= 70) or
+                    (self.htf_bias_strength >= 0.80 and any("MSS" in l for l in l2_labels))
+                )
+                if high_conviction:
+                    l2_needed = 1  # Strong setup — reduce L2 requirement
+
+                if l2_count < l2_needed:
+                    # L2 fail = structural confluence broke; reset AWAITING_CONF tracker.
                     self._awaiting_conf_since.pop(side, None)
-                    logger.debug(f"⛔ {side.upper()} NO_NARRATIVE: catalyst={components['catalyst']:.0f}/35")
+                    logger.debug(f"⛔ {side.upper()} L2 rejected: {l2_count}/{l2_needed} "
+                                 f"(have: {', '.join(l2_labels) if l2_labels else 'none'}) "
+                                 f"Score={score:.0f} Reasons=[{', '.join(reasons[:3])}]")
                     continue
 
-                if components["context"] < NCS_MIN_CONTEXT:
-                    self._awaiting_conf_since.pop(side, None)
-                    logger.debug(f"⛔ {side.upper()} NO_ALIGNMENT: context={components['context']:.0f}/25")
+                # ── L3 GATE: At least 1 confirmation ──────────────────────
+                l3_count, l3_labels = self._cascade_l3(side, current_price, ctx, score, now_ms)
+                if l3_count < CASCADE_L3_MIN_CONFIRMS:
+                    logger.debug(f"⛔ {side.upper()} L3 rejected: {l3_count}/{CASCADE_L3_MIN_CONFIRMS} "
+                                 f"Score={score:.0f}")
                     continue
 
-                # ── Threshold ─────────────────────────────────────────────
+                # ── THRESHOLD: Score must meet regime-adjusted threshold ───
                 threshold = self._get_entry_threshold()
                 if score < threshold:
                     rej_key = f"BELOW_THRESH_{side}_{score:.0f}"
                     if self._should_log_rejection(side, rej_key, now_ms):
-                        logger.info(
-                            f"📊 {side.upper()} near threshold: {score:.0f}/{threshold:.0f} "
-                            f"C={components['catalyst']:.0f} S={components['structure']:.0f} "
-                            f"X={components['context']:.0f} E={components['entry']:.0f} "
-                            f"M={components['micro']:.0f} [{', '.join(reasons[:4])}]"
-                        )
+                        logger.info(f"📊 {side.upper()} near threshold: {score:.0f}/{threshold:.0f} "
+                                    f"L2=[{', '.join(l2_labels)}] L3=[{', '.join(l3_labels)}] "
+                                    f"[{', '.join(reasons[:4])}]")
                     continue
 
                 # ── CONFIRMATION CANDLE GATE (Sniper Filter) ──────────────
@@ -2617,12 +2669,11 @@ class AdvancedICTStrategy:
                 if self._should_log_rejection(side, rej_key, now_ms):
                     logger.info(f"🎯 {side.upper()} PASSED all gates!{tag} "
                                 f"Score={score:.0f}/{threshold:.0f} "
-                                f"[{', '.join(reasons[:5])}]")
+                                f"L2=[{', '.join(l2_labels)}] L3=[{', '.join(l3_labels)}]")
 
                 self._execute_entry(
                     side, current_price, order_manager, risk_manager,
-                    score, reasons, ctx, current_time,
-                    ncs_components=components)
+                    score, reasons, ctx, current_time)
                 return  # Only one entry per evaluation
 
         except Exception as e:
@@ -2975,47 +3026,29 @@ class AdvancedICTStrategy:
         return tp_price
 
     # ==================================================================
-    # INSTITUTIONAL NARRATIVE ENGINE  (replaces L1/L2/L3 gate cascade)
-    # ==================================================================
-    #
-    # Institutions don't run checklists. They assess: "Is there a coherent
-    # narrative here, and am I entering at optimal location within it?"
-    #
-    # Every ICT setup has a hierarchy of evidence:
-    #
-    #   CATALYST   — WHY will price move? (sweep, displacement, BOS)
-    #   STRUCTURE  — HOW confirmed is the directional intent? (MSS quality)
-    #   CONTEXT    — IS the bigger picture aligned? (HTF, regime, DR)
-    #   ENTRY      — WHERE am I entering? (OB/FVG location — bonus)
-    #   MICRO      — DO order-flow signals confirm? (CVD, absorption — bonus)
-    #
-    # A Narrative Completeness Score (NCS) aggregates all five.
-    # Two mandatory minimums replace the L2/L3 binary gate system:
-    #   • catalyst_score ≥ 10  — no footprint, no trade
-    #   • context_score  ≥ 15  — no alignment, no trade
-    # Everything else flows naturally through the score.
-    #
-    # _cascade_l1 is kept ONLY for true absolute disqualifiers:
-    #   CHoCH block, HTF direction conflict, HTF neutral, weekly extreme.
+    # CASCADE L1: Hard gates
     # ==================================================================
 
     def _cascade_l1(self, side: str, price: float, now: int) -> Tuple[bool, str]:
         """
         L1 Gate — HTF bias + IPDA dealing range alignment.
 
-        ICT rules (absolute disqualifiers only — everything else scores):
-        1. Post-CHoCH directional block — explicit invalidation event
-        2. HTF direction directly opposed — never trade against HTF
-        3. HTF NEUTRAL without range-bound mode — no directional context
-        4. Weekly DR extreme (>90% / <10%) hard-oppose — don't fight major weekly level
+        ICT rules:
+        1. HTF must be directional (not NEUTRAL). Trade direction must match HTF.
+        2. Weekly DR hard-oppose: only block if trading EXTREME against HTF trend.
+           - BEARISH trend → block longs at extreme weekly PREMIUM (>75%)
+           - BULLISH trend → block shorts at extreme weekly DISCOUNT (<25%)
+        3. Daily DR: price must be in premium for shorts, discount for longs.
+           BUT — if HTF strongly confirms, allow entry from equilibrium too.
 
-        All other L1 checks from previous versions (HTF strength thresholds,
-        daily DR zone blocks, regime gates, bias conflict gates) are REMOVED.
-        They are now scoring factors in _score_narrative — a weak HTF signal
-        yields a low context_score that fails the minimum, not a hard block.
-        This eliminates false negatives from arbitrary threshold cliffs.
+        RETRACEMENT EXCEPTION (ICT displacement logic):
+        After a large displacement (BOS + strong impulse), price retraces into
+        FVGs/OBs before continuing. Allow counter-trend retracement trades
+        targeting those FVG fills — this IS the institutional model.
         """
-        # ── 1. Post-CHoCH directional block ──────────────────────────────
+        # ── Post-CHoCH directional block (checked before ALL other gates) ───────
+        # After a CHoCH-forced close, re-entering the same direction is forbidden
+        # until the block expires AND a fresh MSS in that direction has formed.
         if self._choch_invalidated_side == side:
             if now < self._choch_block_expires_ms:
                 remaining_min = (self._choch_block_expires_ms - now) / 60_000
@@ -3023,9 +3056,12 @@ class AdvancedICTStrategy:
                     f"Post-CHoCH {side.upper()} block active — "
                     f"{remaining_min:.0f}m remaining. Await new liquidity sweep."
                 )
+            # Block timer expired — require at least one fresh BOS/CHoCH in the
+            # same direction formed AFTER the original CHoCH event.
             required_dir = "bullish" if side == "long" else "bearish"
             has_fresh_mss = any(
-                ms.direction == required_dir and ms.timestamp > self._choch_ts
+                ms.direction == required_dir
+                and ms.timestamp > self._choch_ts
                 for ms in list(self.market_structures)[-20:]
             )
             if has_fresh_mss:
@@ -3033,30 +3069,38 @@ class AdvancedICTStrategy:
                     f"✅ Post-CHoCH {side.upper()} block cleared — "
                     f"fresh {required_dir.upper()} MSS confirmed"
                 )
-                self._choch_invalidated_side = None
+                self._choch_invalidated_side = None  # block lifted
             else:
                 return False, (
-                    f"Post-CHoCH {side.upper()} — no fresh {required_dir.upper()} "
-                    f"BOS/CHoCH since invalidation."
+                    f"Post-CHoCH {side.upper()} — timer expired but no fresh "
+                    f"{required_dir.upper()} BOS/CHoCH since the CHoCH. "
+                    f"Await new structure to restart ICT cycle."
                 )
 
-        # ── 2. Retracement override (displacement → retrace → continue) ──
+        # ── RETRACEMENT OVERRIDE ──────────────────────────────────────────
+        # After displacement, allow retracement trades targeting FVG fills
         if self._is_retracement_trade(side):
+            # Still block at extreme levels (don't retrace-long at weekly premium)
             if self._ndr.weekly is not None:
                 wz = self._ndr.weekly.zone_pct(price)
-                if side == "long"  and wz > 0.90:
+                if side == "long" and wz > 0.80:
                     return False, f"Retracement long blocked — weekly extreme premium ({wz:.0%})"
-                if side == "short" and wz < 0.10:
+                if side == "short" and wz < 0.20:
                     return False, f"Retracement short blocked — weekly extreme discount ({wz:.0%})"
-            self._range_bound_active = False
-            return True, "L1_OK (retracement)"
+            self._range_bound_active = False  # retracement is NOT range-bound mode
+            return True, "L1_OK (retracement after displacement)"
 
-        # ── 3. Range-bound bypass (HTF neutral + ranging ADX) ────────────
+        # ── RANGE-BOUND MODE BYPASS ────────────────────────────────────────
+        # When HTF is NEUTRAL but market is ranging (low ADX, valid DR),
+        # allow mean-reversion trades at DR extremes instead of blocking.
+        # This check must come BEFORE the NEUTRAL rejection so it can
+        # override it.  If range-bound mode doesn't qualify, fall through
+        # to the normal NEUTRAL block below.
         if self.htf_bias == "NEUTRAL" and self._is_range_bound_mode():
             self._range_bound_active = True
             return self._cascade_l1_range_bound(side, price, now)
 
-        # ── 4. HTF direction alignment — absolute ────────────────────────
+        # ── HTF bias alignment ────────────────────────────────────────────
         self._range_bound_active = False
         if self.htf_bias == "NEUTRAL":
             return False, "HTF NEUTRAL — awaiting directional bias"
@@ -3065,664 +3109,457 @@ class AdvancedICTStrategy:
         if side == "short" and self.htf_bias == "BULLISH":
             return False, "HTF BULLISH blocks short"
 
-        # ── 5. Weekly DR hard extreme ─────────────────────────────────────
-        # Only block at EXTREME weekly levels (>90%/<10%) regardless of HTF.
-        if self._ndr.weekly is not None:
-            wz = self._ndr.weekly.zone_pct(price)
-            if side == "long"  and wz > 0.90:
-                return False, f"Weekly extreme premium ({wz:.0%}) hard-blocks long"
-            if side == "short" and wz < 0.10:
-                return False, f"Weekly extreme discount ({wz:.0%}) hard-blocks short"
+        # ── BIAS CONFLICT GATE (v11) ──────────────────────────────────
+        # If HTF and Daily bias CONFLICT, require higher conviction
+        if side == "long" and self.htf_bias == "BULLISH" and self.daily_bias == "BEARISH":
+            if self.htf_bias_strength < 0.80:
+                return False, (
+                    f"BIAS CONFLICT: HTF BULLISH ({self.htf_bias_strength:.0%}) "
+                    f"vs Daily BEARISH — need HTF >= 80% to override"
+                )
+        if side == "short" and self.htf_bias == "BEARISH" and self.daily_bias == "BULLISH":
+            if self.htf_bias_strength < 0.80:
+                return False, (
+                    f"BIAS CONFLICT: HTF BEARISH ({self.htf_bias_strength:.0%}) "
+                    f"vs Daily BULLISH — need HTF >= 80% to override"
+                )
 
-        # ── 6. Post-displacement extreme: don't chase the end of a move ──
+        # ── REGIME GATE (v11) ─────────────────────────────────────────
+        # In DISTRIBUTION regime, block LONGS (smart money distributing)
+        # In ACCUMULATION regime, block SHORTS (smart money accumulating)
+        rs = self.regime_engine.state
+        if rs.regime == REGIME_DISTRIBUTION and side == "long":
+            if self.htf_bias_strength < 0.85:
+                return False, f"DISTRIBUTION regime blocks long (need HTF >= 85%, have {self.htf_bias_strength:.0%})"
+        if rs.regime == REGIME_ACCUMULATION and side == "short":
+            if self.htf_bias_strength < 0.85:
+                return False, f"ACCUMULATION regime blocks short (need HTF >= 85%, have {self.htf_bias_strength:.0%})"
+
+        # ── Minimum HTF strength ─────────────────────────────────────
+        # Weak bias (50-64%) = uncertain market → do NOT trade.
+        # Only strong conviction (≥65%) yields genuinely directional flow.
+        # Retracement trades use a lower bar (45%) because displacement itself
+        # provides the structural conviction.
+        # ACCUMULATION / TRENDING_BULL regime: smart money is absorbing at any
+        # dip — the structural case is already made by regime; allow 60% min.
+        if self._is_retracement_trade(side):
+            min_strength = 0.45
+        elif (rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL) and side == "long") or \
+             (rs.regime in (REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR) and side == "short"):
+            min_strength = 0.60   # regime provides extra structural conviction
+        else:
+            min_strength = 0.65
+        if self.htf_bias_strength < min_strength:
+            return False, (
+                f"HTF {self.htf_bias} bias too weak ({self.htf_bias_strength:.0%} "
+                f"< {min_strength:.0%}) — awaiting stronger conviction"
+            )
+
+        # ── Post-displacement: don't short at the bottom / long at the top ─
+        # If displacement happened in this direction, we're already at the extreme
         if self._displacement_detected:
             if self._displacement_direction == "bearish" and side == "short":
-                if self._displacement_low and price < self._displacement_low * 1.003:
-                    return False, "Post-displacement: at bearish extreme — wait for retracement"
+                # Price is near displacement low — don't short the bottom
+                if self._displacement_low and price < self._displacement_low * 1.005:
+                    return False, "Post-displacement: already at bearish extreme — wait for retracement"
             if self._displacement_direction == "bullish" and side == "long":
-                if self._displacement_high and price > self._displacement_high * 0.997:
-                    return False, "Post-displacement: at bullish extreme — wait for retracement"
+                if self._displacement_high and price > self._displacement_high * 0.995:
+                    return False, "Post-displacement: already at bullish extreme — wait for retracement"
+
+        # ── Weekly DR hard-oppose (HTF-aware) ────────────────────────────
+        if self._ndr.hard_opposed(price, side, self.htf_bias):
+            wz = self._ndr.weekly.zone_pct(price) if self._ndr.weekly else 0.5
+            return False, f"Weekly DR extreme zone ({wz:.0%}) hard-opposes {side}"
+
+        # ── Daily DR zone alignment ───────────────────────────────────────
+        if self._ndr.daily is not None:
+            dz = self._ndr.daily.zone_pct(price)
+            strong_htf = self.htf_bias_strength >= 0.80
+
+            # In ACCUMULATION regime, smart money legitimately bids in premium
+            # zone — raise the block threshold to 88% so price can trend higher.
+            # In DISTRIBUTION regime, smart money offers in discount zone — mirror.
+            if rs.regime == REGIME_ACCUMULATION and side == "long":
+                dr_long_limit = 0.88
+            else:
+                dr_long_limit = 0.75
+            if rs.regime == REGIME_DISTRIBUTION and side == "short":
+                dr_short_limit = 0.12
+            else:
+                dr_short_limit = 0.25
+
+            if side == "long":
+                if dz > dr_long_limit and not strong_htf:
+                    return False, f"Daily DR extreme premium ({dz:.0%}) blocks long"
+            elif side == "short":
+                if dz < dr_short_limit and not strong_htf:
+                    return False, f"Daily DR extreme discount ({dz:.0%}) blocks short"
 
         return True, "L1_OK"
 
     # ==================================================================
-    # NARRATIVE COMPLETENESS SCORE  (_score_narrative)
-    # ==================================================================
-    #
-    # Replaces _cascade_l2, _cascade_l3, _score_confluence.
-    # Returns (total_score, reasons, ctx, components) where components
-    # is a dict of the five scored dimensions.  Two minimums are checked
-    # by the caller: catalyst >= 10 and context >= 15.
+    # CASCADE L2: Need 2 of: Sweep+Disp(fresh), OB/FVG BODY touch, MSS
     # ==================================================================
 
-    def _score_narrative(
-        self,
-        side: str,
-        current_price: float,
-        data_manager,
-        now_ms: int,
-    ) -> Tuple[float, List[str], "TriggerContext", dict]:
+    def _cascade_l2(self, side: str, price: float, ctx: TriggerContext,
+                     now: int) -> Tuple[int, List[str]]:
         """
-        Institutional Narrative Completeness Score — v12.
+        L2 Gate — institutional confluence.
 
-        Five components — scored not gated:
-
-          A. Catalyst   (0-35)  WHY will price move?
-                                ICT sequence: sweep → displacement → MSS.
-                                AMD Manipulation phase adds +5 (Power of 3 fake
-                                sweep IS the catalyst, not a micro confirmation).
-                                Killzone timing adds +4 (London/NY open sweeps
-                                carry institutional edge vs off-hours noise).
-                                Both are additive on catalyst_raw before freshness
-                                decay, capped at 35 — they amplify weak catalysts,
-                                not perfect ones.
-
-          B. Structure  (0-25)  CONVICTION DEPTH — deliberately non-overlapping
-                                with Component A (which already scores the MSS).
-                                  B1. Multi-TF alignment   (0-12): Is the trigger
-                                      MSS confirmed by a higher-TF MSS within 3h?
-                                      A 5m CHoCH confirmed by a 1h CHoCH is a
-                                      fundamentally different signal than a lone
-                                      5m event.
-                                  B2. BOS→CHoCH sequence   (0-8):  Was a trend
-                                      already established (BOS) before the CHoCH
-                                      flipped it?  ICT's highest-quality CHoCH
-                                      appears after a clear BOS chain.
-                                  B3. Sweep-to-MSS speed   (0-5):  Institutional
-                                      response is fast (≤5 min).  Slow confirmation
-                                      (30+ min) = algos/retail catching up, not
-                                      institutional intent.
-
-          C. Context    (0-25)  IS bigger picture aligned?
-                                HTF bias + regime + daily + DR zone +
-                                TARGET LIQUIDITY COUNT: unswept EQH/EQL pools
-                                in the TP direction give price magnetic pull.
-                                More pools = better TP probability (+1-3 pts).
-
-          D. Entry      (0-15)  WHERE are we entering?
-                                OB/FVG zone quality (virgin multiplier from
-                                OrderBlock.virgin_multiplier() — no override).
-                                SWEEP-ZONE PROXIMITY BONUS (+0-4): When the
-                                entry zone sits AT the swept liquidity level
-                                (ICT "mitigation block"), the institutional
-                                footprint is maximally concentrated here.
-
-          E. Micro      (0-12)  DO order-flow signals confirm?
-                                CVD, absorption.
-                                SESSION TIMING (+2-4): KZ = +4, London/NY
-                                session = +2.  Replaces the empty log-only
-                                killzone note that added zero points.
-
-        Hard minimums enforced by caller:
-          • catalyst >= 10   → BLOCKED_NO_NARRATIVE
-          • context  >= 15   → BLOCKED_NO_ALIGNMENT
-
-        Max raw = 112, capped to 100.
+        Changed from v10:
+        - REMOVED proximity triggers (OB_PROXIMITY / FVG_PROXIMITY).
+          Price must be INSIDE the zone. 0.5% "near" counts were allowing
+          entries with price still in distribution, before any actual test.
+        - SWEEP must be FRESH: < 45 minutes old.  Stale sweeps that happened
+          hours ago do not represent current institutional intent.
+        - SWEEP must produce DISPLACEMENT: wick_rejection=True AND displacement_confirmed=True.
+          A sweep without displacement is just price noise, not institutional action.
+        - MSS must occur AFTER the sweep to prove price accepted the new direction.
         """
-        try:
-            reasons: List[str] = []
-            ctx = TriggerContext()
-            rs  = self.regime_engine.state
+        met = []
 
-            target_dir  = "bullish" if side == "long" else "bearish"
-            is_retrace  = self._is_retracement_trade(side)
+        # A. Displacement itself counts for retracement trades
+        if self._is_retracement_trade(side):
+            met.append("DISPLACEMENT")
 
-            # ── Collect nearest swing context (SL/TP derivation) ─────────────
-            if side == "long":
-                lows_b  = [s.price for s in list(self.swing_lows)[-10:]  if s.price < current_price]
-                highs_a = [s.price for s in list(self.swing_highs)[-10:] if s.price > current_price]
-                ctx.nearest_swing_low  = max(lows_b)  if lows_b  else None
-                ctx.nearest_swing_high = min(highs_a) if highs_a else None
-            else:
-                highs_a = [s.price for s in list(self.swing_highs)[-10:] if s.price > current_price]
-                lows_b  = [s.price for s in list(self.swing_lows)[-10:]  if s.price < current_price]
-                ctx.nearest_swing_high = min(highs_a) if highs_a else None
-                ctx.nearest_swing_low  = max(lows_b)  if lows_b  else None
+        # B. Swept liquidity — MUST be fresh AND displaced AND within distance leash
+        SWEEP_FRESHNESS_MS = 45 * 60 * 1000   # 45 minutes — institutional relevance window
+        if ctx.sweep_pool is not None:
+            pool = ctx.sweep_pool
+            age_ms = now - pool.sweep_timestamp
+            is_fresh = age_ms <= SWEEP_FRESHNESS_MS
+            has_disp = pool.displacement_confirmed
+            has_wick = pool.wick_rejection
 
-            # ══════════════════════════════════════════════════════════════════
-            # A. NARRATIVE CATALYST  (0 – 35)
-            # ══════════════════════════════════════════════════════════════════
-            catalyst_raw  = 0.0
-            catalyst_note = "no catalyst"
-            sweep_age_min = 999.0
+            # ── Distance leash (industry-grade) ─────────────────────────────
+            # If price has extended more than SWEEP_MAX_EXTENSION_PCT beyond
+            # the sweep level, the signal is dead.  A genuine sweep+reversal
+            # retraces; a sweep that keeps running is a breakout/trend move.
+            # At 0.8% on BTC that is ~$560 at $70K — a full impulse candle.
+            # EXCEPTION: In trending/accumulation regimes, price legitimately
+            # runs 1-2% after a sweep before forming a re-entry.  Allow 1.8%.
+            base_ext = getattr(config, 'SWEEP_MAX_EXTENSION_PCT', 0.008)
+            regime_ext = self.regime_engine.state.regime if hasattr(self, 'regime_engine') else None
+            trending_regime = regime_ext in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL, REGIME_TRENDING_BEAR)
+            SWEEP_MAX_EXT = base_ext * 2.25 if trending_regime else base_ext
+            extension = abs(price - pool.price) / max(pool.price, 1)
+            is_within_leash = extension <= SWEEP_MAX_EXT
 
-            sweep_age_limit = config.SWEEP_MAX_AGE_MINUTES * 60_000
-            pool_type = "EQL" if side == "long" else "EQH"
-            sweep_pool: Optional["LiquidityPool"] = None
-            for pool in reversed(list(self.liquidity_pools)):
-                if not pool.swept or pool.pool_type != pool_type:
-                    continue
-                age = now_ms - pool.sweep_timestamp
-                if age > sweep_age_limit:
-                    continue
-                sweep_pool = pool
-                ctx.sweep_pool = pool
-                sweep_age_min = age / 60_000
-                break
-
-            has_sweep = sweep_pool is not None
-            has_disp  = sweep_pool.displacement_confirmed if has_sweep else False
-            has_wick  = sweep_pool.wick_rejection         if has_sweep else False
-
-            # MSS search
-            mss_max_age = config.MSS_MAX_AGE_MINUTES * 60_000
-            trending = rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
-                                     REGIME_TRENDING_BEAR, REGIME_DISTRIBUTION)
-            if trending:
-                mss_max_age = int(mss_max_age * 1.5)
-
-            mss_event: Optional["MarketStructure"] = None
-            for ms in reversed(list(self.market_structures)):
-                age_ms = now_ms - ms.timestamp
-                if age_ms > mss_max_age:
-                    break
-                if ms.direction != target_dir:
-                    continue
-                if has_sweep:
-                    pre_ms = sweep_pool.sweep_timestamp - ms.timestamp
-                    if ms.timestamp < sweep_pool.sweep_timestamp:
-                        if trending and pre_ms <= 60 * 60 * 1000:
-                            pass  # allow pre-sweep MSS in trending regime
-                        else:
-                            continue
-                mss_event = ms
-                ctx.mss_event = ms
-                break
-
-            has_mss = mss_event is not None
-            mss_post_sweep = (
-                has_mss and has_sweep and
-                mss_event.timestamp >= sweep_pool.sweep_timestamp
-            )
-
-            # ── ICT sequence scoring ──────────────────────────────────────────
-            if is_retrace:
-                catalyst_raw  = 22.0
-                catalyst_note = f"RETRACE after {self._displacement_direction.upper()} disp"
-                if has_mss:
-                    catalyst_raw  = 30.0
-                    catalyst_note += " + MSS"
-            elif has_sweep and has_disp and has_wick and (has_mss and mss_post_sweep):
-                catalyst_raw  = 35.0
-                catalyst_note = f"sweep+disp+wick+MSS_{mss_event.structure_type}"
-            elif has_sweep and has_disp and (has_mss and mss_post_sweep):
-                catalyst_raw  = 30.0
-                catalyst_note = f"sweep+disp+MSS_{mss_event.structure_type}"
-            elif has_sweep and has_disp and has_wick:
-                catalyst_raw  = 26.0
-                catalyst_note = "sweep+disp+wick (MSS pending)"
-            elif has_sweep and has_disp:
-                catalyst_raw  = 21.0
-                catalyst_note = "sweep+disp (MSS pending)"
-            elif has_sweep and has_wick:
-                catalyst_raw  = 14.0
-                catalyst_note = "sweep+wick (no displacement)"
-            elif has_sweep:
-                catalyst_raw  = 10.0
-                catalyst_note = "sweep only (no displacement)"
-            else:
-                # No sweep — check for HTF BOS (trending continuation)
-                for ms in reversed(list(self.market_structures)):
-                    if (now_ms - ms.timestamp) > mss_max_age:
-                        break
-                    if ms.direction != target_dir:
-                        continue
-                    if ms.structure_type == "BOS" and ms.timeframe in ("1h", "4h"):
-                        catalyst_raw  = 18.0
-                        catalyst_note = f"HTF BOS [{ms.timeframe}] (no pool swept)"
-                        mss_event = ms
-                        ctx.mss_event = ms
-                        has_mss = True
-                        break
-
-            # ── Timing bonuses (additive on catalyst_raw, capped at 35) ──────
-            # AMD MANIPULATION (Power of 3): the fake sweep in the manipulation
-            # phase IS the catalyst.  +5 pts raises a sweep+disp (21) toward
-            # sweep+disp+wick quality (26).  Already-maxed setups are unaffected.
-            # Killzone (London/NY open): institutional windows carry real edge.
-            # +4 pts reflects that a killzone sweep is more reliable than the
-            # same pattern at 3am UTC.  Both are capped — they promote weak
-            # setups, not inflate already-perfect ones.
-            if not is_retrace:
-                if self.amd_phase == "MANIPULATION" and has_sweep:
-                    amd_bonus = min(5.0, 35.0 - catalyst_raw)
-                    catalyst_raw += amd_bonus
-                    reasons.append(f"AMD Manipulation +{amd_bonus:.0f} catalyst")
-                if self.in_killzone and has_sweep:
-                    kz_label = getattr(self, "_active_kz_name", self.current_session)
-                    kz_bonus = min(4.0, 35.0 - catalyst_raw)
-                    catalyst_raw += kz_bonus
-                    reasons.append(f"KZ {kz_label} +{kz_bonus:.0f} catalyst")
-                catalyst_raw = min(catalyst_raw, 35.0)
-
-            # ── Freshness decay ───────────────────────────────────────────────
-            # Full value ≤30 min, decays linearly to 50% by 210 min.
-            if catalyst_raw > 0 and not is_retrace:
-                if has_sweep:
-                    age_for_decay = sweep_age_min
-                elif mss_event is not None:
-                    age_for_decay = (now_ms - mss_event.timestamp) / 60_000
-                else:
-                    age_for_decay = 0.0
-                freshness = max(0.50, 1.0 - max(0.0, age_for_decay - 30.0) / 180.0)
-                catalyst_score = catalyst_raw * freshness
-            else:
-                catalyst_score = catalyst_raw
-
-            if has_sweep and has_disp:
-                sw_pts = round(catalyst_score * 0.65, 1)
-                reasons.append(f"sweep {pool_type}@{sweep_pool.price:.0f} +{sw_pts}")
-            if catalyst_note != "no catalyst":
-                reasons.append(f"Catalyst [{catalyst_note}] +{catalyst_score:.1f}")
-
-            # ══════════════════════════════════════════════════════════════════
-            # B. STRUCTURAL CONVICTION  (0 – 25)
-            # ══════════════════════════════════════════════════════════════════
-            # Deliberately non-overlapping with Component A.
-            # A scores WHAT happened (event sequence).
-            # B scores HOW MUCH MARKET CONVICTION supports it:
-            #   B1. Multi-TF alignment   (0-12)
-            #   B2. BOS→CHoCH sequence   (0-8)
-            #   B3. Sweep-to-MSS speed   (0-5)
-            structure_score = 0.0
-
-            if has_mss and mss_event is not None:
-
-                # ── B1. Multi-TF alignment ────────────────────────────────────
-                # Base points by trigger MSS timeframe; bonus for a confirming
-                # MSS on a higher TF (same direction, within 3h).
-                tf_base = {"5m": 4, "15m": 6, "1h": 9, "4h": 11}.get(
-                    mss_event.timeframe, 4)
-                # CHoCH > BOS: trend-change signal carries more conviction
-                choch_base_bonus = 2 if mss_event.structure_type == "CHoCH" else 0
-
-                htf_tfs_map = {
-                    "5m":  ("15m", "1h"),
-                    "15m": ("1h", "4h"),
-                    "1h":  ("4h",),
-                    "4h":  (),
-                }
-                htf_confirm_tfs = htf_tfs_map.get(mss_event.timeframe, ())
-                htf_confirm_ms  = 3 * 3600 * 1000   # 3-hour window
-                htf_bonus = 0
-                for ms in reversed(list(self.market_structures)):
-                    if (now_ms - ms.timestamp) > htf_confirm_ms:
-                        break
-                    if ms.direction != target_dir:
-                        continue
-                    if ms.timeframe in htf_confirm_tfs:
-                        # Primary higher TF = full bonus; secondary = -1
-                        bonus_base = 3 if ms.timeframe == htf_confirm_tfs[0] else 2
-                        htf_bonus  = min(bonus_base + (1 if ms.structure_type == "CHoCH" else 0), 4)
-                        reasons.append(
-                            f"HTF confirm {ms.structure_type}[{ms.timeframe}] +{htf_bonus}")
-                        break
-
-                b1 = min(tf_base + choch_base_bonus + htf_bonus, 12)
-                structure_score += b1
-                reasons.append(
-                    f"{mss_event.structure_type}[{mss_event.timeframe}] "
-                    f"tf={tf_base} choch={choch_base_bonus} htf={htf_bonus} +{b1}"
+            if is_fresh and has_disp and has_wick and is_within_leash:
+                met.append("SWEEP_DISP_FRESH")
+            elif is_fresh and has_disp and is_within_leash:
+                met.append("SWEEP_DISP")
+            elif is_fresh and not is_within_leash:
+                # Sweep is time-fresh but price has overextended — structurally dead.
+                # Log once (suppressed by debug level) so this doesn't spam the console.
+                logger.debug(
+                    f"L2: Sweep @ ${pool.price:.1f} overextended: price ${price:.1f} "
+                    f"is {extension*100:.2f}% away (max {SWEEP_MAX_EXT*100:.1f}%) — sweep dead"
                 )
+            elif is_fresh:
+                # Stale or no displacement: does not count as a full trigger
+                pass  # Not counted — sweep without displacement is noise
 
-                # ── B2. BOS→CHoCH sequential confirmation ─────────────────────
-                # ICT: best CHoCH appears AFTER an established BOS chain.
-                # Standalone CHoCH from nowhere is a weaker signal.
-                # For BOS-based entries: reward consecutive BOS streak.
-                b2 = 0
-                prior_window_ms = 6 * 3600 * 1000
-                if mss_event.structure_type == "CHoCH":
-                    # Check for a prior BOS in the same direction within 6h
-                    prior_bos_found = False
-                    for ms in reversed(list(self.market_structures)):
-                        if ms is mss_event:
-                            continue
-                        if (now_ms - ms.timestamp) > prior_window_ms:
-                            break
-                        if ms.direction == target_dir and ms.structure_type == "BOS":
-                            prior_bos_found = True
-                            break
-                    if prior_bos_found:
-                        b2 = 8
-                        reasons.append("BOS→CHoCH sequence +8")
-                    else:
-                        # No prior BOS, but multiple recent same-direction MSS = partial conviction
-                        recent_same = sum(
-                            1 for ms in list(self.market_structures)[-20:]
-                            if ms.direction == target_dir and
-                            (now_ms - ms.timestamp) < 2 * 3600 * 1000
-                        )
-                        if recent_same >= 2:
-                            b2 = 4
-                            reasons.append(f"CHoCH +{recent_same} MSS confirm +4")
-                else:  # BOS-based catalyst
-                    recent_bos = sum(
-                        1 for ms in list(self.market_structures)[-15:]
-                        if ms.direction == target_dir and ms.structure_type == "BOS" and
-                        (now_ms - ms.timestamp) < 2 * 3600 * 1000
-                    )
-                    b2 = min(recent_bos * 2, 6)
-                    if b2 > 0:
-                        reasons.append(f"BOS streak ×{recent_bos} +{b2}")
-                structure_score += b2
-
-                # ── B3. Sweep-to-MSS speed ────────────────────────────────────
-                # Fast confirmation = institutional. Slow = retail catch-up.
-                # Only scored when MSS confirmed AFTER the sweep.
-                b3 = 0
-                if has_sweep and mss_post_sweep:
-                    lag_min = (mss_event.timestamp - sweep_pool.sweep_timestamp) / 60_000
-                    if lag_min <= 5:
-                        b3 = 5; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤5) +5")
-                    elif lag_min <= 15:
-                        b3 = 4; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤15) +4")
-                    elif lag_min <= 30:
-                        b3 = 2; reasons.append(f"Sweep→MSS {lag_min:.0f}m (≤30) +2")
-                    # >30 min lag: no speed bonus — institutional window has passed
-                structure_score += b3
-
-                structure_score = min(structure_score, 25.0)
-
-            # ══════════════════════════════════════════════════════════════════
-            # C. CONTEXTUAL ALIGNMENT  (0 – 25, minimum 15 required)
-            # ══════════════════════════════════════════════════════════════════
-            context_score = 0.0
-
-            # HTF alignment (0-20)
-            if (side == "long"  and self.htf_bias == "BULLISH") or \
-               (side == "short" and self.htf_bias == "BEARISH"):
-                htf_pts = 10.0 + 10.0 * self.htf_bias_strength
-                if side == "long"  and self.daily_bias == "BEARISH":
-                    htf_pts = max(0.0, htf_pts - 3.0)
-                elif side == "short" and self.daily_bias == "BULLISH":
-                    htf_pts = max(0.0, htf_pts - 3.0)
-                context_score += htf_pts
-                reasons.append(
-                    f"HTF {self.htf_bias} str={self.htf_bias_strength:.0%} +{htf_pts:.1f}")
-            elif is_retrace:
-                retrace_pts = 8.0 + 6.0 * self.htf_bias_strength
-                context_score += retrace_pts
-                reasons.append(f"RETRACE partial HTF +{retrace_pts:.1f}")
-
-            # Regime alignment penalty for counter-trend trades
-            if trending:
-                aligned = (
-                    (rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL) and side == "long") or
-                    (rs.regime in (REGIME_DISTRIBUTION, REGIME_TRENDING_BEAR) and side == "short")
-                )
-                if not aligned:
-                    context_score -= 4.0
-                    reasons.append(f"Regime {rs.regime} counter-direction -4")
-
-            # Daily bias (+2)
-            if (side == "long"  and self.daily_bias == "BULLISH") or \
-               (side == "short" and self.daily_bias == "BEARISH"):
-                context_score += 2.0
-                reasons.append("Daily bias aligned +2")
-
-            # DR zone (−8 to +5)
-            dr = self._ndr.best_dr()
-            if dr is not None:
-                dz = dr.zone_pct(current_price)
-                if side == "long":
-                    if dz < config.DR_DISCOUNT_THRESHOLD:
-                        dr_pts = round(5.0 * (config.DR_DISCOUNT_THRESHOLD - dz) /
-                                       config.DR_DISCOUNT_THRESHOLD, 1)
-                        context_score += dr_pts
-                        reasons.append(f"DR discount {dz*100:.0f}% +{dr_pts}")
-                    elif dz > 0.88:
-                        context_score -= 8.0
-                        reasons.append(f"DR extreme premium {dz*100:.0f}% -8")
-                    elif dz > 0.75:
-                        context_score -= 4.0
-                        reasons.append(f"DR premium {dz*100:.0f}% -4")
-                else:
-                    if dz > config.DR_PREMIUM_THRESHOLD:
-                        dr_pts = round(5.0 * (dz - config.DR_PREMIUM_THRESHOLD) /
-                                       (1.0 - config.DR_PREMIUM_THRESHOLD), 1)
-                        context_score += dr_pts
-                        reasons.append(f"DR premium {dz*100:.0f}% +{dr_pts}")
-                    elif dz < 0.12:
-                        context_score -= 8.0
-                        reasons.append(f"DR extreme discount {dz*100:.0f}% -8")
-                    elif dz < 0.25:
-                        context_score -= 4.0
-                        reasons.append(f"DR discount {dz*100:.0f}% -4")
-
-            # ── Target liquidity pool count (+0-3) ───────────────────────────
-            # Unswept pools on the TARGET side act as magnetic price targets.
-            # More intact pools = stronger directional pull = better TP
-            # probability.  Pools within 3% of price are actionable.
-            # For LONG: unswept EQH above (price drawn toward equal highs).
-            # For SHORT: unswept EQL below (price drawn toward equal lows).
-            target_pool_type = "EQH" if side == "long" else "EQL"
-            liq_target_count = sum(
-                1 for p in self.liquidity_pools
-                if not p.swept
-                and p.pool_type == target_pool_type
-                and (
-                    (side == "long"  and p.price > current_price * 0.999) or
-                    (side == "short" and p.price < current_price * 1.001)
-                )
-                and abs(p.price - current_price) / current_price <= 0.03
-            )
-            if liq_target_count >= 3:
-                context_score += 3.0
-                reasons.append(f"Target liq {liq_target_count} pools +3")
-            elif liq_target_count == 2:
-                context_score += 2.0
-                reasons.append(f"Target liq 2 pools +2")
-            elif liq_target_count == 1:
-                context_score += 1.0
-                reasons.append(f"Target liq 1 pool +1")
-
-            context_score = min(max(context_score, 0.0), 25.0)
-
-            # ══════════════════════════════════════════════════════════════════
-            # D. ENTRY LOCATION  (0 – 15, pure bonus)
-            # ══════════════════════════════════════════════════════════════════
-            entry_score = 0.0
-            c5m_data = (data_manager.get_candles("5m") or []) if data_manager else []
-            ob_atr = compute_atr(c5m_data, 14) if len(c5m_data) >= 15 else current_price * 0.002
-
-            obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
-            for ob in sorted([o for o in obs if o.is_active(now_ms)],
-                             key=lambda x: x.strength, reverse=True):
-                if ob_atr > 0 and ob.size < ob_atr * 0.3:
-                    continue  # sub-institutional OB
-
-                # Use virgin_multiplier() directly — no arbitrary visit_count
-                # override.  The class already encodes: virgin=1.30, one_touch=1.00,
-                # two_touch=0.70, which correctly penalises worn zones without
-                # a hard-coded 0.40 cliff that contradicts the class definition.
-                vm = ob.virgin_multiplier()
-
-                in_ote  = ob.in_optimal_zone(current_price)
-                in_body = ob.contains_price(current_price)
-
-                if in_ote or in_body:
-                    tag = "OTE" if in_ote else "BODY"
-                    raw_ob = ob.strength / 100.0 * (15.0 if in_ote else 11.0) * vm
-                    if ob.bos_confirmed:    raw_ob += 2.0
-                    if ob.has_displacement: raw_ob += 1.0
-                    raw_ob *= rs.ob_score_multiplier
-                    raw_ob = min(raw_ob, 15.0)
-                    entry_score = max(entry_score, raw_ob)
-                    reasons.append(
-                        f"OB {tag} {ob.low:.0f}-{ob.high:.0f} str={ob.strength:.0f} "
-                        f"v={ob.visit_count} vm={vm:.2f} ×{rs.ob_score_multiplier:.2f} +{raw_ob:.1f}"
-                    )
-                    ctx.trigger_ob = ob
-                    break
-
-            fvgs = self.fvgs_bull if side == "long" else self.fvgs_bear
-            for fvg in [f for f in fvgs if f.is_active(now_ms)]:
-                if fvg.is_price_in_gap(current_price):
-                    freshness_pct = 1.0 - fvg.fill_percentage
-                    raw_fvg = 13.0 * (0.5 + 0.5 * freshness_pct)
-                    raw_fvg *= rs.fvg_score_multiplier
-                    raw_fvg = min(raw_fvg, 15.0)
-                    entry_score = max(entry_score, raw_fvg)
-                    reasons.append(
-                        f"IN FVG {fvg.bottom:.0f}-{fvg.top:.0f} "
-                        f"fill={fvg.fill_percentage*100:.0f}% ×{rs.fvg_score_multiplier:.2f} +{raw_fvg:.1f}"
-                    )
-                    ctx.trigger_fvg = fvg
-                    break
-
-            if ctx.trigger_ob and ctx.trigger_fvg:
-                entry_score = min(entry_score + 3.0, 15.0)
-                reasons.append("OB+FVG confluence +3")
-
-            # ── Sweep-zone proximity bonus (+0-4) ────────────────────────────
-            # ICT "mitigation block": when the entry zone (OB/FVG) sits AT the
-            # swept liquidity level, the institutional footprint is maximally
-            # concentrated.  Price was swept here, then MSS reversed here.
-            # The zone and the catalyst are the SAME price area.
-            # Proximity = distance(zone_midpoint, sweep_price) / zone_size.
-            # prox ≤ 2.0 means the sweep price is within two zone-widths of the mid.
-            if has_sweep and sweep_pool is not None and (ctx.trigger_ob or ctx.trigger_fvg):
-                sweep_px = sweep_pool.price
-                if ctx.trigger_ob:
-                    zone_mid  = ctx.trigger_ob.midpoint
-                    zone_size = max(ctx.trigger_ob.size, ob_atr * 0.1)
-                else:
-                    zone_mid  = ctx.trigger_fvg.midpoint
-                    zone_size = max(ctx.trigger_fvg.size, ob_atr * 0.1)
-                prox = abs(zone_mid - sweep_px) / zone_size
-                if prox <= 2.0:
-                    # Linear: prox=0 → +4, prox=2 → +0
-                    sweep_prox_bonus = round(max(0.0, 4.0 * (1.0 - prox / 2.0)), 1)
-                    if sweep_prox_bonus > 0:
-                        entry_score = min(entry_score + sweep_prox_bonus, 15.0)
-                        reasons.append(
-                            f"Zone@sweep level prox={prox:.1f} +{sweep_prox_bonus:.1f}")
-
-            entry_score = min(entry_score, 15.0)
-
-            # ══════════════════════════════════════════════════════════════════
-            # E. MICROSTRUCTURE  (0 – 12, pure bonus)
-            # ══════════════════════════════════════════════════════════════════
-            # NOTE: AMD Manipulation is now scored in Component A (Catalyst).
-            # Component E scores real-time order flow + session timing only.
-            micro_score = 0.0
-
-            # CVD — latched 30s to prevent ±score oscillation on consecutive ticks
-            raw_cvd = self.volume_analyzer.get_cvd_signal().get("signal", "NEUTRAL")
-            if raw_cvd != "NEUTRAL":
-                self._cvd_latch    = raw_cvd
-                self._cvd_latch_ms = now_ms
-            elif (now_ms - self._cvd_latch_ms) > self._CVD_HOLD_MS:
-                self._cvd_latch = "NEUTRAL"
-            cvd_sig = self._cvd_latch
-
-            if side == "long":
-                if "STRONG" in cvd_sig and "BULL" in cvd_sig:
-                    micro_score += 6.0; reasons.append("CVD Strong Bull +6")
-                elif "BULL" in cvd_sig:
-                    micro_score += 3.0; reasons.append("CVD Bull +3")
-            else:
-                if "STRONG" in cvd_sig and "BEAR" in cvd_sig:
-                    micro_score += 6.0; reasons.append("CVD Strong Bear +6")
-                elif "BEAR" in cvd_sig:
-                    micro_score += 3.0; reasons.append("CVD Bear +3")
-
-            # Absorption (institutional high-volume tiny-body candles at zone)
-            abs_pts = self.absorption_model.absorption_near_price(current_price, side)
-            if abs_pts > 0:
-                micro_score += min(abs_pts, 4.0)
-                reasons.append(f"Absorption +{min(abs_pts, 4):.0f}")
-
-            # ── Session timing bonus ──────────────────────────────────────────
-            # Replaces the previous log-only killzone note that added zero points.
-            # London/NY killzone = +4, session hours (non-KZ) = +2.
-            # This reflects genuine edge: institutional sweeps during killzones
-            # are statistically more reliable than off-hours price action.
-            if self.in_killzone:
-                kz_label = getattr(self, "_active_kz_name", self.current_session)
-                micro_score += 4.0
-                reasons.append(f"KZ {kz_label} +4")
-            elif self.current_session in ("NEW_YORK", "LONDON"):
-                micro_score += 2.0
-                reasons.append(f"Session {self.current_session} +2")
-
-            micro_score = min(micro_score, 12.0)
-
-            # ══════════════════════════════════════════════════════════════════
-            # TOTAL
-            # ══════════════════════════════════════════════════════════════════
-            total = catalyst_score + structure_score + context_score + entry_score + micro_score
-            total = min(max(total, 0.0), 100.0)
-
-            components = {
-                "catalyst":  catalyst_score,
-                "structure": structure_score,
-                "context":   context_score,
-                "entry":     entry_score,
-                "micro":     micro_score,
-            }
-
-            return total, reasons, ctx, components
-
-        except Exception as e:
-            logger.error(f"❌ Narrative scoring error: {e}", exc_info=True)
-            return 0.0, [], TriggerContext(), {
-                "catalyst": 0.0, "structure": 0.0,
-                "context": 0.0, "entry": 0.0, "micro": 0.0
-            }
-
-    # ------------------------------------------------------------------
-    # Legacy shims — kept so the range-bound path and _evaluate_entry
-    # (second call site, not yet refactored) still compile.  They simply
-    # delegate to _score_narrative.
-    # ------------------------------------------------------------------
-
-    def _cascade_l2(self, side: str, price: float, ctx: "TriggerContext",
-                    now: int) -> Tuple[int, List[str]]:
-        """Deprecated — retained for range-bound path compatibility."""
-        met: List[str] = []
-        if ctx.sweep_pool is not None and ctx.sweep_pool.displacement_confirmed:
-            met.append("SWEEP_DISP_FRESH" if ctx.sweep_pool.wick_rejection else "SWEEP_DISP")
+        # C. OB touch — price must be INSIDE the OB body or OTE zone.
+        #    NO proximity. Price must have actually tested the level.
         if ctx.trigger_ob is not None:
-            met.append("OB_OTE" if ctx.trigger_ob.in_optimal_zone(price) else "OB_BODY")
-        if ctx.trigger_fvg is not None and ctx.trigger_fvg.is_price_in_gap(price):
-            met.append("FVG_TOUCH")
+            ob = ctx.trigger_ob
+            in_body = ob.contains_price(price)
+            in_ote  = ob.in_optimal_zone(price)
+            if in_body or in_ote:
+                tag = "OB_OTE" if in_ote else "OB_BODY"
+                met.append(tag)
+            # Proximity (within 0.5%) is intentionally NOT counted.
+            # Institutional traders wait for PRICE to BE at the zone.
+
+        # D. FVG touch — price must be INSIDE the gap.
+        #    NO proximity. Unfilled gap must actually contain current price.
+        if ctx.trigger_fvg is not None:
+            fvg = ctx.trigger_fvg
+            if fvg.is_price_in_gap(price):
+                met.append("FVG_TOUCH")
+            # Note: near-FVG proximity NOT counted (see note on OB above)
+
+        # E. Recent MSS in direction — MUST be:
+        #    1. After the sweep (if sweep exists)
+        #    2. Within MSS_MAX_AGE_MINUTES (ENFORCED strictly — v11 fix)
+        #    3. On a relevant timeframe
+        MSS_MAX_AGE_MS = config.MSS_MAX_AGE_MINUTES * 60 * 1000
         if ctx.mss_event is not None:
-            met.append(f"MSS_{ctx.mss_event.structure_type}")
+            ms = ctx.mss_event
+            sweep_ts = ctx.sweep_pool.sweep_timestamp if ctx.sweep_pool else 0
+            age_ms = now - ms.timestamp
+
+            # In trending/accumulation regimes, MSS age window is extended
+            # by 50% — structure persists longer in trending conditions.
+            _rs = self.regime_engine.state
+            _trending = _rs.regime in (REGIME_ACCUMULATION, REGIME_TRENDING_BULL,
+                                        REGIME_TRENDING_BEAR, REGIME_DISTRIBUTION)
+            effective_max_age = int(MSS_MAX_AGE_MS * 1.5) if _trending else MSS_MAX_AGE_MS
+
+            if age_ms > effective_max_age:
+                # MSS too old — not valid for entry
+                logger.debug(
+                    f"L2: MSS_{ms.structure_type} [{ms.timeframe}] "
+                    f"is {age_ms / 60_000:.0f}m old (max {effective_max_age / 60_000:.0f}m) — expired"
+                )
+            elif ms.timestamp < sweep_ts:
+                # MSS formed before the sweep.
+                # In trending regimes, an MSS that formed up to 60 min before
+                # the sweep is still valid structural context — price BOS'd first,
+                # then liquidity was swept into that BOS.  Allow it.
+                pre_sweep_ms = sweep_ts - ms.timestamp
+                if _trending and pre_sweep_ms <= 60 * 60 * 1000:
+                    met.append(f"MSS_{ms.structure_type}")
+                    logger.debug(
+                        f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep by "
+                        f"{pre_sweep_ms / 60_000:.0f}m — allowed in trending regime"
+                    )
+                else:
+                    logger.debug(
+                        f"L2: MSS_{ms.structure_type} [{ms.timeframe}] predates sweep "
+                        f"({pre_sweep_ms / 60_000:.0f}m earlier) — not counted"
+                    )
+            else:
+                met.append(f"MSS_{ms.structure_type}")
+
         return len(met), met
 
-    def _cascade_l3(self, side: str, price: float, ctx: "TriggerContext",
-                    score: float, now: int) -> Tuple[int, List[str]]:
-        """Deprecated — retained for range-bound path compatibility."""
-        met: List[str] = []
-        cvd = self.volume_analyzer.get_cvd_signal().get("signal", "NEUTRAL")
-        if side == "long" and "BULL" in cvd:
+    # ==================================================================
+    # CASCADE L3: Confirmations (need 1 of N)
+    # ==================================================================
+
+    def _cascade_l3(self, side: str, price: float, ctx: TriggerContext,
+                     score: float, now: int) -> Tuple[int, List[str]]:
+        met = []
+
+        # CVD aligned
+        cvd = self.volume_analyzer.get_cvd_signal()
+        sig = cvd.get("signal", "NEUTRAL")
+        if side == "long" and "BULL" in sig:
             met.append("CVD_BULL")
-        elif side == "short" and "BEAR" in cvd:
+        elif side == "short" and "BEAR" in sig:
             met.append("CVD_BEAR")
-        if self.absorption_model.absorption_near_price(price, side) > 0:
+
+        # Absorption event
+        abs_score = self.absorption_model.absorption_near_price(price, side)
+        if abs_score > 0:
             met.append("ABSORPTION")
+
+        # Killzone
         if self.in_killzone:
             met.append("KILLZONE")
+
+        # AMD manipulation phase + sweep
         if self.amd_phase == "MANIPULATION" and ctx.sweep_pool is not None:
             met.append("AMD_MANIP")
+
+        # Daily bias alignment
         if (side == "long" and self.daily_bias == "BULLISH") or \
            (side == "short" and self.daily_bias == "BEARISH"):
             met.append("DAILY_BIAS")
+
         return len(met), met
 
+    # ==================================================================
+    # CONFLUENCE SCORING
+    # ==================================================================
+
     def _score_confluence(self, side: str, current_price: float,
-                          data_manager, now_ms: int) -> Tuple[float, List[str], "TriggerContext"]:
-        """Deprecated shim — delegates to _score_narrative."""
-        score, reasons, ctx, _ = self._score_narrative(
-            side, current_price, data_manager, now_ms)
-        return score, reasons, ctx
+                          data_manager, now_ms: int) -> Tuple[float, List[str], TriggerContext]:
+        try:
+            score   = 0.0
+            reasons = []
+            ctx     = TriggerContext()
+
+            # ── 1. HTF Bias (0-25) ─────────────────────────────────────
+            if (side == "long" and self.htf_bias == "BULLISH") or \
+               (side == "short" and self.htf_bias == "BEARISH"):
+                bias_score = 15.0 + 10.0 * self.htf_bias_strength
+                score += bias_score
+                reasons.append(f"HTF {self.htf_bias} str={self.htf_bias_strength:.0%} +{bias_score:.1f}")
+            elif self._is_retracement_trade(side):
+                # Retracement trade: award moderate score for being in valid
+                # ICT retracement setup (displacement → retrace → continue)
+                retrace_score = 12.0 + 8.0 * self.htf_bias_strength
+                score += retrace_score
+                reasons.append(f"RETRACE after {self._displacement_direction.upper()} disp +{retrace_score:.1f}")
+            elif self._range_bound_active:
+                # ── Range-bound: score DR zone depth instead of HTF bias ──
+                # Deeper in discount (for longs) or premium (for shorts) = more points.
+                # This replaces the HTF alignment points which are 0 in NEUTRAL.
+                dr = self._get_range_bound_dr()
+                if dr is not None:
+                    zone = dr.zone_pct(current_price)
+                    if side == "long":
+                        # Zone 0.00 = maximum discount = maximum score
+                        depth = max(0.0, 1.0 - zone / 0.382)  # 0→1 as zone goes 0.382→0
+                        rb_score = 10.0 + 15.0 * depth
+                        score += rb_score
+                        reasons.append(f"RANGE discount zone={zone*100:.0f}% depth={depth:.0%} +{rb_score:.1f}")
+                    else:
+                        # Zone 1.00 = maximum premium = maximum score
+                        depth = max(0.0, (zone - 0.618) / 0.382)  # 0→1 as zone goes 0.618→1
+                        rb_score = 10.0 + 15.0 * depth
+                        score += rb_score
+                        reasons.append(f"RANGE premium zone={zone*100:.0f}% depth={depth:.0%} +{rb_score:.1f}")
+
+            # ── 2. Liquidity Sweep (0-25) ──────────────────────────────
+            sweep_age_limit = config.SWEEP_MAX_AGE_MINUTES * 60_000
+            for pool in reversed(list(self.liquidity_pools)):
+                if not pool.swept:
+                    continue
+                if (now_ms - pool.sweep_timestamp) > sweep_age_limit:
+                    continue
+                if (side == "long" and pool.pool_type == "EQL") or \
+                   (side == "short" and pool.pool_type == "EQH"):
+                    sweep_s = 15.0
+                    if pool.displacement_confirmed:
+                        sweep_s += 5.0
+                    if pool.wick_rejection:
+                        sweep_s += 5.0
+                    score += sweep_s
+                    reasons.append(f"Sweep {pool.pool_type} @ {pool.price:.0f} +{sweep_s:.1f}")
+                    ctx.sweep_pool = pool
+                    break
+
+            # ── 3. Order Block (0-30) ──────────────────────────────────
+            obs = self.order_blocks_bull if side == "long" else self.order_blocks_bear
+            # v11: compute ATR for OB quality filter
+            c5m_for_atr = (self._data_manager.get_candles("5m") or []) if self._data_manager else []
+            ob_atr = compute_atr(c5m_for_atr, 14) if len(c5m_for_atr) >= 15 else current_price * 0.002
+            for ob in sorted([o for o in obs if o.is_active(now_ms)],
+                             key=lambda x: x.strength, reverse=True):
+                # v11: OB quality filter — skip OBs too small relative to ATR
+                if ob_atr > 0 and ob.size < ob_atr * 0.3:
+                    continue  # OB too small — not institutional
+
+                virgin_m = ob.virgin_multiplier()
+                # v11: Penalize heavily-visited OBs more aggressively
+                if ob.visit_count >= 2:
+                    virgin_m = 0.40  # 60% penalty on 2+ visits
+
+                if ob.contains_price(current_price) or ob.in_optimal_zone(current_price):
+                    in_ote = ob.in_optimal_zone(current_price)
+                    ob_score = ob.strength / 100 * (30.0 if in_ote else 22.0) * virgin_m
+                    if ob.bos_confirmed:
+                        ob_score += 5.0
+                    if ob.has_displacement:
+                        ob_score += 3.0
+                    score += ob_score
+                    tag = "OTE" if in_ote else "BODY"
+                    reasons.append(
+                        f"OB {tag} {ob.low:.0f}-{ob.high:.0f} str={ob.strength:.0f} "
+                        f"v={ob.visit_count} +{ob_score:.1f}")
+                    ctx.trigger_ob = ob
+                    break
+                # Proximity scoring intentionally removed — only score OB when price IS inside it
+
+            # ── 4. FVG (0-25) ──────────────────────────────────────────
+            fvgs = self.fvgs_bull if side == "long" else self.fvgs_bear
+            for fvg in [f for f in fvgs if f.is_active(now_ms)]:
+                if fvg.is_price_in_gap(current_price):
+                    freshness = 1.0 - fvg.fill_percentage
+                    fvg_score = 20.0 * (0.5 + 0.5 * freshness)
+                    score += fvg_score
+                    reasons.append(f"IN FVG {fvg.bottom:.0f}-{fvg.top:.0f} fill={fvg.fill_percentage*100:.0f}% +{fvg_score:.1f}")
+                    ctx.trigger_fvg = fvg
+                    break
+                # Proximity scoring intentionally removed — only score FVG when price IS inside it
+
+            # ── 5. OB + FVG overlap bonus ──────────────────────────────
+            if ctx.trigger_ob and ctx.trigger_fvg:
+                score += 8.0
+                reasons.append("OB+FVG confluence +8")
+
+            # ── 6. Market Structure (0-15) ─────────────────────────────
+            target_dir = "bullish" if side == "long" else "bearish"
+            mss_window = config.MSS_MAX_AGE_MINUTES * 60_000
+            for ms in reversed(list(self.market_structures)):
+                if (now_ms - ms.timestamp) > mss_window:
+                    break
+                if ms.direction == target_dir:
+                    ms_score = 15.0 if ms.structure_type == "CHoCH" else 10.0
+                    score += ms_score
+                    reasons.append(f"{ms.structure_type} {ms.direction} [{ms.timeframe}] +{ms_score}")
+                    ctx.mss_event = ms
+                    break
+
+            # ── 7. CVD (0-10) ──────────────────────────────────────────
+            cvd = self.volume_analyzer.get_cvd_signal()
+            sig = cvd.get("signal", "NEUTRAL")
+            if side == "long" and "STRONG" in sig and "BULL" in sig:
+                score += 10.0; reasons.append("CVD Strong Bull +10")
+            elif side == "long" and "BULL" in sig:
+                score += 5.0; reasons.append("CVD Bull +5")
+            elif side == "short" and "STRONG" in sig and "BEAR" in sig:
+                score += 10.0; reasons.append("CVD Strong Bear +10")
+            elif side == "short" and "BEAR" in sig:
+                score += 5.0; reasons.append("CVD Bear +5")
+
+            # ── 8. Absorption (0-12) ───────────────────────────────────
+            abs_bonus = self.absorption_model.absorption_near_price(current_price, side)
+            if abs_bonus > 0:
+                score += abs_bonus
+                reasons.append(f"Absorption +{abs_bonus:.0f}")
+
+            # ── 9. Killzone bonus (0-8) ────────────────────────────────
+            if self.in_killzone:
+                kz_label = getattr(self, "_active_kz_name", self.current_session)
+                score += 8.0
+                reasons.append(f"Killzone {kz_label} +8")
+
+            # ── 10. DR Zone (0-12 / -18 penalty) ──────────────────────
+            dr = self._ndr.best_dr()
+            if dr is not None:
+                zone = dr.zone_pct(current_price)
+                if side == "long" and dr.is_discount(current_price):
+                    dr_bonus = round(12.0 * (config.DR_DISCOUNT_THRESHOLD - zone) / config.DR_DISCOUNT_THRESHOLD, 1)
+                    score += dr_bonus
+                    reasons.append(f"Discount zone {zone*100:.0f}% +{dr_bonus}")
+                elif side == "short" and dr.is_premium(current_price):
+                    dr_bonus = round(12.0 * (zone - config.DR_PREMIUM_THRESHOLD) / (1 - config.DR_PREMIUM_THRESHOLD), 1)
+                    score += dr_bonus
+                    reasons.append(f"Premium zone {zone*100:.0f}% +{dr_bonus}")
+
+            # ── 11. Nearest swings for SL/TP context ───────────────────
+            if side == "long":
+                lows_below  = [s.price for s in list(self.swing_lows)[-10:] if s.price < current_price]
+                highs_above = [s.price for s in list(self.swing_highs)[-10:] if s.price > current_price]
+                ctx.nearest_swing_low  = max(lows_below)  if lows_below  else None
+                ctx.nearest_swing_high = min(highs_above) if highs_above else None
+            else:
+                highs_above = [s.price for s in list(self.swing_highs)[-10:] if s.price > current_price]
+                lows_below  = [s.price for s in list(self.swing_lows)[-10:] if s.price < current_price]
+                ctx.nearest_swing_high = min(highs_above) if highs_above else None
+                ctx.nearest_swing_low  = max(lows_below)  if lows_below  else None
+
+            # ── Regime adjustments ─────────────────────────────────────
+            rs = self.regime_engine.state
+            if ctx.trigger_ob and rs.ob_score_multiplier != 1.0:
+                adj = 15.0 * (rs.ob_score_multiplier - 1.0)
+                score += adj
+                if abs(adj) >= 1.0:
+                    reasons.append(f"Regime OB adj {adj:+.1f}")
+            if ctx.trigger_fvg and rs.fvg_score_multiplier != 1.0:
+                adj = 10.0 * (rs.fvg_score_multiplier - 1.0)
+                score += adj
+                if abs(adj) >= 1.0:
+                    reasons.append(f"Regime FVG adj {adj:+.1f}")
+
+            score = min(max(score, 0.0), 100.0)
+            return score, reasons, ctx
+
+        except Exception as e:
+            logger.error(f"❌ Confluence scoring error: {e}", exc_info=True)
+            return 0.0, [], TriggerContext()
 
     # ==================================================================
-    # ENTRY THRESHOLD  (simplified — regime handled in context component)
+    # ENTRY THRESHOLD
     # ==================================================================
 
     def _get_entry_threshold(self) -> float:
+        # ── Range-bound mode uses its own threshold ──────────────────
         if self._range_bound_active:
             return self._get_range_bound_entry_threshold()
 
@@ -3733,9 +3570,6 @@ class AdvancedICTStrategy:
         else:
             base = config.ENTRY_THRESHOLD_REGULAR
 
-        # Regime modifier from regime_engine (TRENDING/ACCUM = -5, RANGING = +5, etc.)
-        # Context component already incorporates regime into the score, but we still
-        # apply the threshold modifier for regimes that change required conviction.
         regime_mod = self.regime_engine.state.entry_threshold_modifier
         return base + regime_mod
 
@@ -4167,8 +4001,7 @@ class AdvancedICTStrategy:
     def _execute_entry(self, side: str, current_price: float,
                        order_manager, risk_manager, score: float,
                        reasons: List[str], ctx: TriggerContext,
-                       current_time: int,
-                       ncs_components: Optional[Dict] = None) -> None:
+                       current_time: int) -> None:
         try:
             # Spam suppression: only log full HIGH CONFLUENCE block once per cycle
             exec_key = f"EXEC_{side}_{score:.0f}"
@@ -4355,11 +4188,10 @@ class AdvancedICTStrategy:
                 )
 
             # Store entry context for close report
-            self.entry_score      = score
-            self.entry_reasons    = list(reasons)
-            self.entry_components = dict(ncs_components) if ncs_components else {}
+            self.entry_score = score
+            self.entry_reasons = list(reasons)
             self.max_favorable_excursion = 0.0
-            self.max_adverse_excursion   = 0.0
+            self.max_adverse_excursion = 0.0
 
             # DR zone tag for context
             dr_zone_tag = self._get_dr_zone_tag(current_price)
@@ -4389,7 +4221,6 @@ class AdvancedICTStrategy:
                 regime_size_mult=rs.size_multiplier,
                 dr_mult=dr_mult,
                 current_price=current_price,
-                ncs_components=self.entry_components,
             )
             send_telegram_message(msg)
 
@@ -6315,12 +6146,11 @@ class AdvancedICTStrategy:
         self.highest_price_reached   = None
         self.lowest_price_reached    = None
         self.breakeven_moved         = False
-        self._trail_activated        = False
+        self._trail_activated        = False           # ← ADDED: reset trail gate
         self.profit_locked_pct       = 0.0
         self.entry_pending_start     = None
         self.entry_score             = 0.0
         self.entry_reasons           = []
-        self.entry_components        = {}
         self.entry_quantity          = 0.0
         self.max_favorable_excursion = 0.0
         self.max_adverse_excursion   = 0.0

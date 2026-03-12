@@ -509,60 +509,41 @@ def format_market_outlook(
     # ── TRADE PLAN — The "What I'm Thinking" Section ────
     lines.append("<b>🎯 TRADE PLAN</b>")
 
-    def _plan_lines(plan: dict, emoji: str, label: str) -> list:
-        """Format a single side's plan with NCS component breakdown."""
-        out = [f"  <b>{emoji} {label}:</b>"]
-        status = plan.get("status", "?")
-        status_icon = {
-            "READY":                "✅",
-            "BLOCKED_L1":           "⛔",
-            "BLOCKED_NO_NARRATIVE": "🔍",
-            "BLOCKED_NO_ALIGNMENT": "🧭",
-            "BELOW_THRESHOLD":      "📊",
-            "NO_STRUCTURE":         "🏗",
-            "PLACEMENT_LOCKED":     "🔒",
-        }.get(status, "⏳")
-        out.append(f"    {status_icon} {status}")
-
-        if plan.get("gate_failed"):
-            out.append(f"    ❌ {_esc(plan['gate_failed'])}")
-
-        if status == "READY":
-            if plan.get("entry"):
-                out.append(f"    Entry: {_fmt_price(plan['entry'])}")
-            if plan.get("sl"):
-                out.append(f"    SL: {_fmt_price(plan['sl'])} ({_esc(plan.get('sl_reason', ''))})")
-            if plan.get("tp"):
-                out.append(f"    TP: {_fmt_price(plan['tp'])} ({_esc(plan.get('tp_reason', ''))})")
-            if plan.get("rr"):
-                out.append(f"    RR: {plan['rr']:.1f}x | Score: {plan.get('score', 0):.0f}/{plan.get('threshold', 0):.0f}")
-        else:
-            # Show NCS component breakdown for blocked/pending plans
-            comp = plan.get("components")
-            if comp:
-                cat = comp.get("catalyst", 0)
-                stt = comp.get("structure", 0)
-                ctx = comp.get("context", 0)
-                ent = comp.get("entry", 0)
-                mic = comp.get("micro", 0)
-                out.append(
-                    f"    NCS: C<b>{cat:.0f}</b>/35 "
-                    f"S<b>{stt:.0f}</b>/25 "
-                    f"X<b>{ctx:.0f}</b>/25 "
-                    f"E<b>{ent:.0f}</b>/15 "
-                    f"M<b>{mic:.0f}</b>/12"
-                )
-            if plan.get("missing"):
-                out.append(f"    ⏳ {_esc(plan['missing'])}")
-        return out
-
     if long_plan:
-        lines.extend(_plan_lines(long_plan, "📗", "LONG"))
+        lines.append(f"  <b>📗 LONG PLAN:</b>")
+        lines.append(f"    Status: {long_plan.get('status', '?')}")
+        if long_plan.get('gate_failed'):
+            lines.append(f"    ❌ Blocked: {_esc(long_plan['gate_failed'])}")
+        else:
+            if long_plan.get('entry'):
+                lines.append(f"    Entry: {_fmt_price(long_plan['entry'])}")
+            if long_plan.get('sl'):
+                lines.append(f"    SL: {_fmt_price(long_plan['sl'])} ({_esc(long_plan.get('sl_reason', ''))})")
+            if long_plan.get('tp'):
+                lines.append(f"    TP: {_fmt_price(long_plan['tp'])} ({_esc(long_plan.get('tp_reason', ''))})")
+            if long_plan.get('rr'):
+                lines.append(f"    RR: {long_plan['rr']:.1f} | Score: {long_plan.get('score', 0):.0f}/{long_plan.get('threshold', 0):.0f}")
+            if long_plan.get('missing'):
+                lines.append(f"    ⏳ Need: {_esc(long_plan['missing'])}")
     else:
         lines.append("  📗 LONG: No valid setup")
 
     if short_plan:
-        lines.extend(_plan_lines(short_plan, "📕", "SHORT"))
+        lines.append(f"  <b>📕 SHORT PLAN:</b>")
+        lines.append(f"    Status: {short_plan.get('status', '?')}")
+        if short_plan.get('gate_failed'):
+            lines.append(f"    ❌ Blocked: {_esc(short_plan['gate_failed'])}")
+        else:
+            if short_plan.get('entry'):
+                lines.append(f"    Entry: {_fmt_price(short_plan['entry'])}")
+            if short_plan.get('sl'):
+                lines.append(f"    SL: {_fmt_price(short_plan['sl'])} ({_esc(short_plan.get('sl_reason', ''))})")
+            if short_plan.get('tp'):
+                lines.append(f"    TP: {_fmt_price(short_plan['tp'])} ({_esc(short_plan.get('tp_reason', ''))})")
+            if short_plan.get('rr'):
+                lines.append(f"    RR: {short_plan['rr']:.1f} | Score: {short_plan.get('score', 0):.0f}/{short_plan.get('threshold', 0):.0f}")
+            if short_plan.get('missing'):
+                lines.append(f"    ⏳ Need: {_esc(short_plan['missing'])}")
     else:
         lines.append("  📕 SHORT: No valid setup")
 
@@ -651,8 +632,6 @@ def format_entry_alert(
     regime_size_mult: float = 1.0,
     dr_mult: float = 1.0,
     current_price: float = 0.0,
-    # NCS component breakdown (new)
-    ncs_components: Optional[Dict] = None,
 ) -> str:
     """Comprehensive entry notification with every price level for chart verification."""
 
@@ -675,21 +654,6 @@ def format_entry_alert(
     lines.append(f"  RR:        <b>{rr:.1f}:1</b>")
     lines.append(f"  Size:      {position_size:.4f} BTC")
     lines.append("")
-
-    # ── NCS Component Breakdown ─────────────────────────
-    if ncs_components:
-        c = ncs_components
-        lines.append("<b>🧮 NARRATIVE SCORE</b>")
-        lines.append(
-            f"  Catalyst: <b>{c.get('catalyst', 0):.0f}</b>/35  "
-            f"Structure: <b>{c.get('structure', 0):.0f}</b>/25"
-        )
-        lines.append(
-            f"  Context:  <b>{c.get('context', 0):.0f}</b>/25  "
-            f"Entry: <b>{c.get('entry', 0):.0f}</b>/15  "
-            f"Micro: <b>{c.get('micro', 0):.0f}</b>/12"
-        )
-        lines.append("")
 
     # ── Structure Justification ─────────────────────────
     lines.append("<b>🔍 STRUCTURE</b>")

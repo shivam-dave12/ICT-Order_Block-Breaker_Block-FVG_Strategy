@@ -298,15 +298,14 @@ class OrderManager:
                 )
                 return None
 
-            # ── Non-retryable error (e.g. 400 Bad Request, 422 Unprocessable) ─
-            # These errors will not improve with retrying — return immediately.
-            # Log as error if we have already retried (attempt > 0), else warning.
-            if attempt > 0:
-                logger.error(f"place_order non-retryable failure after {attempt + 1} "
+            # ── Exhausted normal retries ──────────────────────────────
+            if attempt >= self._MAX_RETRIES - 1:
+                logger.error(f"place_order permanent failure after {attempt + 1} "
                              f"attempts: status={sc} msg={msg}")
-            else:
-                logger.warning(f"place_order non-retryable failure on first attempt: "
-                               f"status={sc} msg={msg}")
+                return None
+
+            logger.warning(f"place_order non-retryable failure (attempt {attempt + 1}): "
+                           f"status={sc} msg={msg}")
             return None
 
         logger.error(f"place_order exhausted all attempts ({total_attempts})")
