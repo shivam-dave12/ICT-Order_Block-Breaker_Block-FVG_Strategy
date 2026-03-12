@@ -423,6 +423,11 @@ class AdvancedICTStrategy:
 
         # Timing
         self._last_structure_update_ms = 0
+        # CVD hold: latch a confirmed non-NEUTRAL CVD signal for 30s to prevent
+        # the micro score from oscillating ±4 pts between ticks near the threshold.
+        self._cvd_latch:      str = "NEUTRAL"
+        self._cvd_latch_ms:   int = 0
+        self._CVD_HOLD_MS:    int = 30_000   # hold CVD signal 30 seconds
         # self._last_entry_eval_ms removed — entry eval runs every tick
         self._last_outlook_ms          = 0
         self._placement_locked_until   = 0
@@ -2392,10 +2397,17 @@ class AdvancedICTStrategy:
                         f"${zone_top:.1f} — price breaking out, not rejecting"
                     )
             else:  # long
-                recently_below = any(float(c['l']) < zone_bottom for c in approach_window)
+                # For an ORDER BLOCK: price must have swept below zone_bottom (wick below OB low)
+                # For a FAIR VALUE GAP: price just needs to have entered the gap (low < zone_top)
+                # ICT distinction: OB is a mitigation candle test; FVG is a gap-fill retracement.
+                is_fvg = ctx.trigger_ob is None and ctx.trigger_fvg is not None
+                approach_level = zone_top if is_fvg else zone_bottom
+                approach_desc  = f"zone_top ${zone_top:.1f} (FVG entry)" if is_fvg else f"zone_bottom ${zone_bottom:.1f} (OB sweep)"
+
+                recently_below = any(float(c['l']) < approach_level for c in approach_window)
                 if not recently_below:
                     return False, (
-                        f"Approach invalid: price never traded below zone_bottom ${zone_bottom:.1f} "
+                        f"Approach invalid: price never traded below {approach_desc} "
                         f"in last {lookback_n} bars — cannot be a bullish retest"
                     )
                 last4 = approach_window[-4:] if len(approach_window) >= 4 else approach_window
@@ -3431,8 +3443,18 @@ class AdvancedICTStrategy:
             #
             micro_score = 0.0
 
-            # CVD
-            cvd_sig = self.volume_analyzer.get_cvd_signal().get("signal", "NEUTRAL")
+            # CVD — latched to prevent ±4 pt oscillation near threshold.
+            # A non-NEUTRAL signal is held for _CVD_HOLD_MS (30s) before
+            # reverting to NEUTRAL.  This stops tick-level noise from toggling
+            # the micro score in and out on consecutive evaluations.
+            raw_cvd = self.volume_analyzer.get_cvd_signal().get("signal", "NEUTRAL")
+            if raw_cvd != "NEUTRAL":
+                self._cvd_latch    = raw_cvd
+                self._cvd_latch_ms = now_ms
+            elif (now_ms - self._cvd_latch_ms) > self._CVD_HOLD_MS:
+                self._cvd_latch = "NEUTRAL"
+            cvd_sig = self._cvd_latch
+
             if side == "long":
                 if "STRONG" in cvd_sig and "BULL" in cvd_sig:
                     micro_score += 8.0; reasons.append("CVD Strong Bull +8")
