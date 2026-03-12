@@ -4687,7 +4687,11 @@ class AdvancedICTStrategy:
     def _detect_choch_against_position(self, side: str, current_time: int) -> bool:
         """
         Returns True if a confirmed CHoCH has formed AGAINST the open position
-        on the trading timeframe (5m) or the next higher timeframe (15m).
+        on the 15m timeframe only.
+
+        5m CHoCH signals are intentionally excluded — they produce too much noise
+        and cause premature exits on normal retracements. The 15m timeframe
+        provides cleaner, higher-conviction structure breaks.
 
         Rules — institutional definition:
           LONG position  → bearish CHoCH = price closes below a prior swing low
@@ -4703,7 +4707,7 @@ class AdvancedICTStrategy:
 
         entry_time = self.active_position.get("entry_time", 0) if self.active_position else 0
         max_age_ms = getattr(config, 'TRAIL_SWING_MAX_AGE_MS', 4 * 3600 * 1000)
-        valid_tfs   = {"5m", "15m"}
+        valid_tfs   = {"15m"}  # 5m excluded — too noisy, causes premature exits
 
         for ms in reversed(list(self.market_structures)):
             if ms.structure_type != "CHoCH":
