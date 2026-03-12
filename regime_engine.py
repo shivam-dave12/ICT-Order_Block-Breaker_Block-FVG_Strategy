@@ -562,20 +562,20 @@ class RegimeEngine:
                 "tce_max_age_ms": 2 * 3600 * 1000,
             },
             REGIME_ACCUMULATION: {
-                "entry_threshold_modifier": 0.0,
+                "entry_threshold_modifier": -5.0,  # Structural absorption = directional conviction
                 "size_multiplier": 0.90,
                 "sl_atr_multiplier": 1.3,
                 "ob_score_multiplier": 1.20,
-                "fvg_score_multiplier": 1.10,
+                "fvg_score_multiplier": 1.15,
                 "sweep_score_multiplier": 1.20,
                 "tce_max_age_ms": 4 * 3600 * 1000,
             },
             REGIME_DISTRIBUTION: {
-                "entry_threshold_modifier": 0.0,
+                "entry_threshold_modifier": -5.0,  # Structural distribution = directional conviction
                 "size_multiplier": 0.90,
                 "sl_atr_multiplier": 1.3,
                 "ob_score_multiplier": 1.20,
-                "fvg_score_multiplier": 1.10,
+                "fvg_score_multiplier": 1.15,
                 "sweep_score_multiplier": 1.20,
                 "tce_max_age_ms": 4 * 3600 * 1000,
             },

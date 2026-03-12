@@ -436,8 +436,16 @@ class TelegramBotController:
                         top = plan["reasons"][:5]
                         lines.append(f"  Reasons: {', '.join(top)}")
                 else:
-                    icon = "⛔"
-                    lines.append(f"{icon} <b>{label}{rb_tag}: {status}</b>")
+                    # Map new status codes to readable icons
+                    status_icon = {
+                        "BLOCKED_L1":           "⛔",
+                        "BLOCKED_NO_NARRATIVE": "🔍",
+                        "BLOCKED_NO_ALIGNMENT": "🧭",
+                        "BELOW_THRESHOLD":      "📊",
+                        "NO_STRUCTURE":         "🏗",
+                        "PLACEMENT_LOCKED":     "🔒",
+                    }.get(status, "⛔")
+                    lines.append(f"{status_icon} <b>{label}{rb_tag}: {status}</b>")
                     gate = plan.get("gate_failed", "unknown")
                     lines.append(f"  Reason: {gate}")
 
@@ -445,8 +453,17 @@ class TelegramBotController:
                     if plan.get("missing"):
                         lines.append(f"  Need: {plan['missing']}")
 
-                    # Show partial score if we got that far
-                    if plan.get("score"):
+                    # Show NCS component breakdown if available
+                    comp = plan.get("components")
+                    if comp:
+                        lines.append(
+                            f"  NCS → C:{comp.get('catalyst',0):.0f}/35 "
+                            f"S:{comp.get('structure',0):.0f}/25 "
+                            f"X:{comp.get('context',0):.0f}/25 "
+                            f"E:{comp.get('entry',0):.0f}/15 "
+                            f"M:{comp.get('micro',0):.0f}/12"
+                        )
+                    elif plan.get("score"):
                         threshold = plan.get("threshold", 0)
                         score = plan.get("score", 0)
                         lines.append(f"  Score: {score:.0f}"
@@ -493,6 +510,7 @@ class TelegramBotController:
                 missing = plan.get("missing") or ""
                 score = plan.get("score", 0)
                 threshold = plan.get("threshold", 0)
+                comp = plan.get("components") or {}
 
                 if gate or missing:
                     lines.append(f"\n{label} needs:")
@@ -502,6 +520,17 @@ class TelegramBotController:
                         lines.append(f"  • {missing}")
                     if score and threshold and score < threshold:
                         lines.append(f"  • Score {score:.0f}/{threshold:.0f} — needs {threshold - score:.0f} more pts")
+                    # Show component hints for actionable feedback
+                    if comp:
+                        cat = comp.get("catalyst", 0)
+                        ctx_s = comp.get("context", 0)
+                        ent = comp.get("entry", 0)
+                        if cat < 10:
+                            lines.append(f"    ↳ Catalyst {cat:.0f}/35 — need sweep+displacement or HTF BOS")
+                        if ctx_s < 15:
+                            lines.append(f"    ↳ Context {ctx_s:.0f}/25 — need stronger HTF bias or better DR zone")
+                        if ent == 0:
+                            lines.append(f"    ↳ Entry 0/15 — price not in any OB or FVG zone")
                     added = True
 
             # Nearest structure zones
